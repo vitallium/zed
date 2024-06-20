@@ -1,7 +1,7 @@
 # Ruby
 
 - Tree Sitter: [tree-sitter-ruby](https://github.com/tree-sitter/tree-sitter-ruby)
-- Language Servers: [solargraph](https://github.com/castwide/solargraph), [ruby-lsp](https://github.com/Shopify/ruby-lsp)
+- Language Servers: [solargraph](https://github.com/castwide/solargraph), [ruby-lsp](https://github.com/Shopify/ruby-lsp), [rubocop](https://docs.rubocop.org/rubocop/usage/lsp.html)
 
 ## Choosing a language server
 
@@ -16,6 +16,19 @@ To switch to `ruby-lsp`, add the following to your `settings.json`:
   "languages": {
     "Ruby": {
       "language_servers": ["ruby-lsp", "!solargraph", "..."]
+    }
+  }
+}
+```
+
+The Ruby extension also provides support for `rubocop` language server for offense detection and autocorrection. To enable it, add the following to your
+`settings.json`:
+
+```json
+{
+  "languages": {
+    "Ruby": {
+      "language_servers": ["rubocop", "ruby-lsp", "!solargraph", "..."]
     }
   }
 }
@@ -82,6 +95,31 @@ Ruby LSP uses pull-based diagnostics which Zed doesn't support yet. We can tell 
 }
 ```
 
+## Setting up `rubocop` LSP
+
+Zed currently doesn't install `rubocop` automatically. To use `rubocop`, you need to install the gem. Zed just looks for an executable called `rubocop` on your `PATH`.
+
+You can install the gem manually with the following command:
+
+```shell
+gem install rubocop
+```
+
+TODO: Add note how to use bundled `rubocop`.
+
+Rubocop has unsafe autocorrection disabled by default. We can tell Zed to enable it by adding the following to your `settings.json`:
+
+```json
+{
+  "lsp": {
+    "rubocop": {
+      "initialization_options": {
+        "safeAutocorrect": false
+      }
+    }
+  }
+}
+```
 
 ## Using the Tailwind CSS Language Server with Ruby
 
