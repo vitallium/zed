@@ -320,3 +320,51 @@ To run tests in your Ruby project, you can set up custom tasks in your local `.z
   }
 ]
 ```
+
+## ERB template engine
+
+An easy to use but powerful templating system for Ruby.
+
+### Configuring ERB
+
+Due to the implementation details of the used [tree-sitter-embedded-template](https://github.com/tree-sitter/tree-sitter-embedded-template) grammar for ERB, the ERB syntax should be treated as a composite of HTML and Ruby. In order to configure and apply settings for it, most settings must be placed under the corresponding `languages` configuration key.
+
+```jsonc
+{
+  "languages": {
+    "Ruby": {
+      "language_servers": ["ruby-lsp", "rubocop", "!solargraph"]
+    },
+    "HTML": {
+      "ensure_final_newline_on_save": true
+    }
+  }
+}
+```
+
+For example, to configure `soft_wrap` for the HTML language in an ERB template, set the `soft_wrap` configuration key under the HTML language:
+
+```jsonc
+{
+  "languages": {
+    "HTML": {
+      "soft_wrap": "editor_width"
+    }
+  }
+}
+```
+
+To configure `soft_wrap` for ERB globally, set the `soft_wrap` configuration key for both the HTML and Ruby languages:
+
+```jsonc
+{
+  "languages": {
+    "HTML": {
+      "soft_wrap": "editor_width"
+    },
+    "Ruby": {
+      "soft_wrap": "editor_width"
+    }
+  }
+}
+```
