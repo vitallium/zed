@@ -11,7 +11,7 @@ use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
 use git_ui::worktree_picker::WorktreePicker;
 pub use platform_title_bar::{
-    self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
+    self, DraggedWindowTab, MergeAllWindows, MoveTabToNextWindow, PlatformTitleBar,
     ShowNextWindowTab, ShowPreviousWindowTab,
 };
 use project::{linked_worktree_short_name, repo_identity_path};

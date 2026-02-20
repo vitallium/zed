@@ -139,6 +139,8 @@ pub trait Platform: 'static {
         None
     }
 
+    fn add_tabbed_window(&self, _target: AnyWindowHandle, _window: AnyWindowHandle) {}
+
     fn is_screen_capture_supported(&self) -> bool {
         false
     }
@@ -160,6 +162,9 @@ pub trait Platform: 'static {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
+
+    /// Controls whether the platform should allow automatic window tabbing globally
+    fn set_automatic_window_tabbing(&self, _enabled: bool) {}
 
     /// Returns the appearance of the application's windows.
     fn window_appearance(&self) -> WindowAppearance;
@@ -690,6 +695,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn move_tab_to_new_window(&self) {}
     fn toggle_window_tab_overview(&self) {}
     fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
+    fn system_window_tab_participant(&self) -> bool {
+        false
+    }
 
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
@@ -1532,6 +1540,9 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// Whether this window is allowed to participate in Zed-managed native window tab groups.
+    pub system_window_tab_participant: bool,
 }
 
 /// The variables that can be configured when creating a new window
@@ -1590,6 +1601,8 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+    #[cfg(target_os = "macos")]
+    pub system_window_tab_participant: bool,
 }
 
 /// Represents the status of how a window should be opened.
@@ -1649,6 +1662,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            system_window_tab_participant: false,
         }
     }
 }

@@ -1306,6 +1306,8 @@ impl Window {
             icon,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            system_window_tab_participant,
         } = options;
 
         let initial_window_title = titlebar
@@ -1330,13 +1332,15 @@ impl Window {
                 icon,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
+                #[cfg(target_os = "macos")]
+                system_window_tab_participant,
             },
         )?;
 
         let tab_bar_visible = platform_window.tab_bar_visible();
         SystemWindowTabController::init_visible(cx, tab_bar_visible);
         if let Some(tabs) = platform_window.tabbed_windows() {
-            SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
+            SystemWindowTabController::sync_tab_group(cx, handle.window_id(), tabs);
         }
 
         let display_id = platform_window.display().map(|display| display.id());
@@ -1645,7 +1649,7 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, _window, cx| {
-                        SystemWindowTabController::move_tab_to_new_window(cx, handle.window_id());
+                        SystemWindowTabController::sync_all_window_tab_groups(cx);
                     })
                     .log_err();
             })
@@ -1655,7 +1659,7 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, _window, cx| {
-                        SystemWindowTabController::merge_all_windows(cx, handle.window_id());
+                        SystemWindowTabController::merge_all_window_tabs(cx, handle.window_id());
                     })
                     .log_err();
             })
@@ -5501,6 +5505,11 @@ impl Window {
     pub fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
         self.platform_window
             .set_tabbing_identifier(tabbing_identifier)
+    }
+
+    /// Returns whether this window may participate in Zed-managed native window tabs.
+    pub fn system_window_tab_participant(&self) -> bool {
+        self.platform_window.system_window_tab_participant()
     }
 
     /// Request the OS to play an alert sound. On some platforms this is associated

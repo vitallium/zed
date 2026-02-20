@@ -400,6 +400,7 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
         } else {
             None
         },
+        system_window_tab_participant: true,
         ..Default::default()
     }
 }

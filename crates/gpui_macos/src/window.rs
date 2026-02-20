@@ -108,7 +108,8 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
-#[derive(PartialEq)]
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum UserTabbingPreference {
     Never,
     Always,
@@ -523,6 +524,7 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    system_window_tab_participant: bool,
 }
 
 impl MacWindowState {
@@ -753,6 +755,7 @@ impl MacWindow {
             display_id,
             window_min_size,
             tabbing_identifier,
+            system_window_tab_participant,
             ..
         }: WindowParams,
         cursor_visible: Arc<AtomicBool>,
@@ -762,13 +765,7 @@ impl MacWindow {
     ) -> Self {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
-
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
-            if allows_automatic_window_tabbing {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
-            } else {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
-            }
 
             let mut style_mask;
             if let Some(titlebar) = titlebar.as_ref() {
@@ -917,6 +914,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                system_window_tab_participant,
             })));
 
             (*native_window).set_ivar(
@@ -970,6 +968,7 @@ impl MacWindow {
             let app: id = NSApplication::sharedApplication(nil);
             let main_window: id = msg_send![app, mainWindow];
             let mut sheet_parent = None;
+            let is_normal_window = kind == WindowKind::Normal;
 
             match kind {
                 WindowKind::Normal | WindowKind::Floating => {
@@ -981,7 +980,7 @@ impl MacWindow {
                     }
                     native_window.setAcceptsMouseMovedEvents_(YES);
 
-                    if let Some(tabbing_identifier) = tabbing_identifier {
+                    if let Some(tabbing_identifier) = tabbing_identifier.as_ref() {
                         let tabbing_id = ns_string(tabbing_identifier.as_str());
                         let _: () = msg_send![native_window, setTabbingIdentifier: tabbing_id];
                     } else {
@@ -1031,6 +1030,7 @@ impl MacWindow {
             }
 
             if allows_automatic_window_tabbing
+                && is_normal_window
                 && !main_window.is_null()
                 && main_window != native_window
             {
@@ -1043,19 +1043,19 @@ impl MacWindow {
                     || user_tabbing_preference == UserTabbingPreference::InFullScreen
                         && main_window_is_fullscreen;
 
-                if should_add_as_tab {
-                    let main_window_can_tab: BOOL =
-                        msg_send![main_window, respondsToSelector: sel!(addTabbedWindow:ordered:)];
-                    let main_window_visible: BOOL = msg_send![main_window, isVisible];
+                if should_add_as_tab
+                    && tabbing_identifier
+                        .as_ref()
+                        .is_some_and(|tabbing_identifier| {
+                            Self::can_add_as_tab_to_window(main_window, tabbing_identifier)
+                        })
+                {
+                    let _: () = msg_send![main_window, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
 
-                    if main_window_can_tab == YES && main_window_visible == YES {
-                        let _: () = msg_send![main_window, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
-
-                        // Ensure the window is visible immediately after adding the tab, since the tab bar is updated with a new entry at this point.
-                        // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the main window is not fullscreen.
-                        if !main_window_is_fullscreen {
-                            let _: () = msg_send![native_window, orderFront: nil];
-                        }
+                    // Ensure the window is visible immediately after adding the tab, since the tab bar is updated with a new entry at this point.
+                    // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the main window is not fullscreen.
+                    if !main_window_is_fullscreen {
+                        let _: () = msg_send![native_window, orderFront: nil];
                     }
                 }
             }
@@ -1119,6 +1119,47 @@ impl MacWindow {
         }
     }
 
+    pub fn native_window_for_handle(handle: AnyWindowHandle) -> Option<id> {
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let windows: id = msg_send![app, orderedWindows];
+            let count: NSUInteger = msg_send![windows, count];
+
+            for i in 0..count {
+                let window: id = msg_send![windows, objectAtIndex:i];
+                if msg_send![window, isKindOfClass: WINDOW_CLASS] {
+                    let window_handle = get_window_state(&*window).lock().handle;
+                    if window_handle == handle {
+                        return Some(window);
+                    }
+                }
+            }
+
+            None
+        }
+    }
+
+    pub fn add_tabbed_window(target: AnyWindowHandle, window: AnyWindowHandle) {
+        let Some(target_window) = Self::native_window_for_handle(target) else {
+            return;
+        };
+        let Some(window) = Self::native_window_for_handle(window) else {
+            return;
+        };
+
+        unsafe {
+            let Some(target_tabbing_identifier) = Self::window_tabbing_identifier(target_window)
+            else {
+                return;
+            };
+            if !Self::can_add_as_tab_to_window(window, &target_tabbing_identifier) {
+                return;
+            }
+
+            let _: () = msg_send![target_window, addTabbedWindow: window ordered: NSWindowOrderingMode::NSWindowAbove];
+        }
+    }
+
     pub fn get_user_tabbing_preference() -> Option<UserTabbingPreference> {
         unsafe {
             let defaults: id = NSUserDefaults::standardUserDefaults();
@@ -1138,11 +1179,53 @@ impl MacWindow {
                 "".into()
             };
 
-            match value_str.as_ref() {
-                "manual" => Some(UserTabbingPreference::Never),
-                "always" => Some(UserTabbingPreference::Always),
-                _ => Some(UserTabbingPreference::InFullScreen),
-            }
+            Some(Self::parse_user_tabbing_preference(value_str.as_ref()))
+        }
+    }
+
+    fn parse_user_tabbing_preference(value: &str) -> UserTabbingPreference {
+        match value {
+            "manual" => UserTabbingPreference::Never,
+            "always" => UserTabbingPreference::Always,
+            _ => UserTabbingPreference::InFullScreen,
+        }
+    }
+
+    unsafe fn can_add_as_tab_to_window(window: id, expected_tabbing_identifier: &str) -> bool {
+        let is_gpui_window: BOOL = unsafe { msg_send![window, isKindOfClass: WINDOW_CLASS] };
+        let can_tab: BOOL =
+            unsafe { msg_send![window, respondsToSelector: sel!(addTabbedWindow:ordered:)] };
+        let visible: BOOL = unsafe { msg_send![window, isVisible] };
+        let tabbing_identifier = unsafe { Self::window_tabbing_identifier(window) };
+
+        Self::can_add_as_tab_to_window_with_attributes(
+            is_gpui_window == YES,
+            can_tab == YES,
+            visible == YES,
+            tabbing_identifier.as_deref(),
+            expected_tabbing_identifier,
+        )
+    }
+
+    fn can_add_as_tab_to_window_with_attributes(
+        is_gpui_window: bool,
+        can_tab: bool,
+        visible: bool,
+        tabbing_identifier: Option<&str>,
+        expected_tabbing_identifier: &str,
+    ) -> bool {
+        is_gpui_window
+            && can_tab
+            && visible
+            && tabbing_identifier == Some(expected_tabbing_identifier)
+    }
+
+    unsafe fn window_tabbing_identifier(window: id) -> Option<String> {
+        let identifier: id = unsafe { msg_send![window, tabbingIdentifier] };
+        if identifier.is_null() {
+            None
+        } else {
+            Some(unsafe { identifier.to_str().to_string() })
         }
     }
 }
@@ -1257,13 +1340,6 @@ impl PlatformWindow for MacWindow {
     fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
         let native_window = self.0.lock().native_window;
         unsafe {
-            let allows_automatic_window_tabbing = tabbing_identifier.is_some();
-            if allows_automatic_window_tabbing {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
-            } else {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
-            }
-
             if let Some(tabbing_identifier) = tabbing_identifier {
                 let tabbing_id = ns_string(tabbing_identifier.as_str());
                 let _: () = msg_send![native_window, setTabbingIdentifier: tabbing_id];
@@ -1271,6 +1347,10 @@ impl PlatformWindow for MacWindow {
                 let _: () = msg_send![native_window, setTabbingIdentifier:nil];
             }
         }
+    }
+
+    fn system_window_tab_participant(&self) -> bool {
+        self.0.lock().system_window_tab_participant
     }
 
     fn set_traffic_light_position(&self, position: Point<Pixels>) {
@@ -3115,8 +3195,6 @@ extern "C" fn move_tab_to_new_window(this: &Object, _: Sel, _: id) {
 
 extern "C" fn merge_all_windows(this: &Object, _: Sel, _: id) {
     unsafe {
-        let _: () = msg_send![super(this, class!(NSWindow)), mergeAllWindows:nil];
-
         let window_state = get_window_state(this);
         let mut lock = window_state.as_ref().lock();
         if let Some(mut callback) = lock.merge_all_windows_callback.take() {
@@ -3165,7 +3243,71 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use cocoa::base::nil;
+
+    use super::{MacWindow, UserTabbingPreference, display_id_for_screen};
+
+    #[test]
+    fn parses_user_tabbing_preference() {
+        assert_eq!(
+            MacWindow::parse_user_tabbing_preference("manual"),
+            UserTabbingPreference::Never
+        );
+        assert_eq!(
+            MacWindow::parse_user_tabbing_preference("always"),
+            UserTabbingPreference::Always
+        );
+        assert_eq!(
+            MacWindow::parse_user_tabbing_preference(""),
+            UserTabbingPreference::InFullScreen
+        );
+        assert_eq!(
+            MacWindow::parse_user_tabbing_preference("unexpected"),
+            UserTabbingPreference::InFullScreen
+        );
+    }
+
+    #[test]
+    fn validates_tab_attachment_target_attributes() {
+        assert!(MacWindow::can_add_as_tab_to_window_with_attributes(
+            true,
+            true,
+            true,
+            Some("zed"),
+            "zed"
+        ));
+        assert!(!MacWindow::can_add_as_tab_to_window_with_attributes(
+            false,
+            true,
+            true,
+            Some("zed"),
+            "zed"
+        ));
+        assert!(!MacWindow::can_add_as_tab_to_window_with_attributes(
+            true,
+            false,
+            true,
+            Some("zed"),
+            "zed"
+        ));
+        assert!(!MacWindow::can_add_as_tab_to_window_with_attributes(
+            true,
+            true,
+            false,
+            Some("zed"),
+            "zed"
+        ));
+        assert!(!MacWindow::can_add_as_tab_to_window_with_attributes(
+            true, true, true, None, "zed"
+        ));
+        assert!(!MacWindow::can_add_as_tab_to_window_with_attributes(
+            true,
+            true,
+            true,
+            Some("settings"),
+            "zed"
+        ));
+    }
 
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {

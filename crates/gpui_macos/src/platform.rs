@@ -635,6 +635,10 @@ impl Platform for MacPlatform {
         Some(MacWindow::ordered_windows())
     }
 
+    fn add_tabbed_window(&self, target: AnyWindowHandle, window: AnyWindowHandle) {
+        MacWindow::add_tabbed_window(target, window);
+    }
+
     fn open_window(
         &self,
         handle: AnyWindowHandle,
@@ -658,6 +662,13 @@ impl Platform for MacPlatform {
             background_executor,
             renderer_context,
         )))
+    }
+
+    fn set_automatic_window_tabbing(&self, enabled: bool) {
+        unsafe {
+            let value = if enabled { YES } else { NO };
+            let _: () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: value];
+        }
     }
 
     fn window_appearance(&self) -> WindowAppearance {

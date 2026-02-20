@@ -22,7 +22,8 @@ use crate::{
 };
 
 pub use system_window_tabs::{
-    DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, ShowNextWindowTab, ShowPreviousWindowTab,
+    DraggedWindowTab, MergeAllWindows, MoveTabToNextWindow, ShowNextWindowTab,
+    ShowPreviousWindowTab,
 };
 
 pub struct PlatformTitleBar {

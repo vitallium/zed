@@ -4,6 +4,7 @@ use gpui::{
     AnyWindowHandle, Context, Hsla, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
     Styled, SystemWindowTab, SystemWindowTabController, Window, WindowId, actions, canvas, div,
 };
+use util::ResultExt as _;
 
 use theme_settings::ThemeSettings;
 use ui::{
@@ -21,7 +22,7 @@ actions!(
         ShowNextWindowTab,
         ShowPreviousWindowTab,
         MergeAllWindows,
-        MoveTabToNewWindow
+        MoveTabToNextWindow
     ]
 );
 
@@ -55,12 +56,14 @@ impl SystemWindowTabs {
     pub fn init(cx: &mut App) {
         let mut was_use_system_window_tabs =
             WorkspaceSettings::get_global(cx).use_system_window_tabs;
+        cx.set_automatic_window_tabbing(was_use_system_window_tabs);
 
         cx.observe_global::<SettingsStore>(move |cx| {
             let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
             if use_system_window_tabs == was_use_system_window_tabs {
                 return;
             }
+            cx.set_automatic_window_tabbing(use_system_window_tabs);
             was_use_system_window_tabs = use_system_window_tabs;
 
             let tabbing_identifier = if use_system_window_tabs {
@@ -69,14 +72,16 @@ impl SystemWindowTabs {
                 None
             };
 
-            if use_system_window_tabs {
-                SystemWindowTabController::init(cx);
-            }
+            SystemWindowTabController::init(cx);
 
             cx.windows().iter().for_each(|handle| {
-                let _ = handle.update(cx, |_, window, cx| {
-                    window.set_tabbing_identifier(tabbing_identifier.clone());
-                    if use_system_window_tabs {
+                handle.update(cx, |_, window, cx| {
+                    if window.system_window_tab_participant() {
+                        window.set_tabbing_identifier(tabbing_identifier.clone());
+                    } else {
+                        window.set_tabbing_identifier(None);
+                    }
+                    if use_system_window_tabs && window.system_window_tab_participant() {
                         let tabs = if let Some(tabs) = window.tabbed_windows() {
                             tabs
                         } else {
@@ -86,9 +91,9 @@ impl SystemWindowTabs {
                             )]
                         };
 
-                        SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
+                        SystemWindowTabController::sync_tab_group(cx, handle.window_id(), tabs);
                     }
-                });
+                }).log_err();
             });
         })
         .detach();
@@ -117,26 +122,53 @@ impl SystemWindowTabs {
                             window.window_handle().window_id(),
                         );
                     })
-                    .on_action(move |_: &MoveTabToNewWindow, window, cx| {
-                        SystemWindowTabController::move_tab_to_new_window(
-                            cx,
-                            window.window_handle().window_id(),
-                        );
-                        window.move_tab_to_new_window();
+                    .on_action(move |_: &MoveTabToNextWindow, window, cx| {
+                        Self::move_current_tab_to_next_window(window, cx);
                     })
                 })
                 .when(tab_groups.len() > 1, |div| {
                     div.on_action(move |_: &MergeAllWindows, window, cx| {
-                        SystemWindowTabController::merge_all_windows(
+                        SystemWindowTabController::merge_all_window_tabs(
                             cx,
                             window.window_handle().window_id(),
                         );
-                        window.merge_all_windows();
                     })
                 })
             });
         })
         .detach();
+    }
+
+    fn move_current_tab_to_next_window(window: &mut Window, cx: &mut App) {
+        let window_handle = window.window_handle();
+        let Some(target) =
+            SystemWindowTabController::get_next_tab_group_window(cx, window_handle.window_id())
+                .copied()
+        else {
+            return;
+        };
+
+        cx.add_window_tab(target, window_handle);
+        SystemWindowTabController::sync_all_window_tab_groups(cx);
+    }
+
+    fn move_tab_to_next_window(tab: &SystemWindowTab, window: &mut Window, cx: &mut App) {
+        Self::move_window_tab_to_next_window(tab.id, tab.handle, window, cx);
+    }
+
+    fn move_window_tab_to_next_window(
+        id: WindowId,
+        handle: AnyWindowHandle,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if id == window.window_handle().window_id() {
+            Self::move_current_tab_to_next_window(window, cx);
+        } else {
+            handle.update(cx, |_, window, cx| {
+                Self::move_current_tab_to_next_window(window, cx);
+            }).log_err();
+        }
     }
 
     fn render_tab(
@@ -292,7 +324,7 @@ impl SystemWindowTabs {
                             window,
                             &tabs,
                             |tab| tab.id == item.id,
-                            |window, cx| {
+                            |_tab, window, cx| {
                                 window.dispatch_action(Box::new(CloseWindow), cx);
                             },
                         );
@@ -304,24 +336,20 @@ impl SystemWindowTabs {
                             window,
                             &other_tabs,
                             |tab| tab.id != item.id,
-                            |window, cx| {
+                            |_tab, window, cx| {
                                 window.dispatch_action(Box::new(CloseWindow), cx);
                             },
                         );
                     });
 
-                    menu = menu.entry("Move Tab to New Window", None, move |window, cx| {
+                    menu = menu.entry("Move Tab to Next Window", None, move |window, cx| {
                         Self::handle_right_click_action(
                             cx,
                             window,
                             &move_tabs,
                             |tab| tab.id == item.id,
-                            |window, cx| {
-                                SystemWindowTabController::move_tab_to_new_window(
-                                    cx,
-                                    window.window_handle().window_id(),
-                                );
-                                window.move_tab_to_new_window();
+                            |tab, window, cx| {
+                                Self::move_tab_to_next_window(tab, window, cx);
                             },
                         );
                     });
@@ -332,7 +360,7 @@ impl SystemWindowTabs {
                             window,
                             &merge_tabs,
                             |tab| tab.id == item.id,
-                            |window, _cx| {
+                            |_tab, window, _cx| {
                                 window.toggle_window_tab_overview();
                             },
                         );
@@ -367,15 +395,15 @@ impl SystemWindowTabs {
         mut action: F,
     ) where
         P: Fn(&SystemWindowTab) -> bool,
-        F: FnMut(&mut Window, &mut App),
+        F: FnMut(&SystemWindowTab, &mut Window, &mut App),
     {
         for tab in tabs {
             if predicate(tab) {
                 if tab.id == window.window_handle().window_id() {
-                    action(window, cx);
+                    action(tab, window, cx);
                 } else {
                     let _ = tab.handle.update(cx, |_view, window, cx| {
-                        action(window, cx);
+                        action(tab, window, cx);
                     });
                 }
             }
@@ -432,14 +460,7 @@ impl Render for SystemWindowTabs {
                 MouseButton::Left,
                 cx.listener(|this, _event, window, cx| {
                     if let Some(tab) = this.last_dragged_tab.take() {
-                        SystemWindowTabController::move_tab_to_new_window(cx, tab.id);
-                        if tab.id == window.window_handle().window_id() {
-                            window.move_tab_to_new_window();
-                        } else {
-                            let _ = tab.handle.update(cx, |_, window, _cx| {
-                                window.move_tab_to_new_window();
-                            });
-                        }
+                        Self::move_window_tab_to_next_window(tab.id, tab.handle, window, cx);
                     }
                 }),
             )

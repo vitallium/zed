@@ -18,7 +18,6 @@ use futures::{
     channel::oneshot,
     future::{LocalBoxFuture, Shared},
 };
-use itertools::Itertools;
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
@@ -414,8 +413,8 @@ impl SystemWindowTabController {
             .find_map(|(group, tabs)| tabs.iter().find(|tab| tab.id == id).map(|_| group));
 
         let current_group = current_group?;
-        // TODO: `.keys()` returns arbitrary order, what does "next" mean?
         let mut group_ids: Vec<_> = controller.tab_groups.keys().collect();
+        group_ids.sort();
         let idx = group_ids.iter().position(|g| *g == current_group)?;
         let next_idx = (idx + 1) % group_ids.len();
 
@@ -439,8 +438,8 @@ impl SystemWindowTabController {
             .find_map(|(group, tabs)| tabs.iter().find(|tab| tab.id == id).map(|_| group));
 
         let current_group = current_group?;
-        // TODO: `.keys()` returns arbitrary order, what does "previous" mean?
         let mut group_ids: Vec<_> = controller.tab_groups.keys().collect();
+        group_ids.sort();
         let idx = group_ids.iter().position(|g| *g == current_group)?;
         let prev_idx = if idx == 0 {
             group_ids.len() - 1
@@ -535,37 +534,113 @@ impl SystemWindowTabController {
         }
     }
 
-    /// Insert a tab into a tab group.
-    pub fn add_tab(cx: &mut App, id: WindowId, tabs: Vec<SystemWindowTab>) {
+    /// Sync a native tab group into the controller.
+    pub fn sync_tab_group(cx: &mut App, id: WindowId, tabs: Vec<SystemWindowTab>) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
-        let Some(tab) = tabs.iter().find(|tab| tab.id == id).cloned() else {
+        controller.sync_tab_group_by_id(id, tabs);
+    }
+
+    /// Syncs all eligible native window tab groups into the controller.
+    pub fn sync_all_window_tab_groups(cx: &mut App) {
+        let mut seen_tabs = FxHashSet::default();
+
+        for handle in cx.windows() {
+            if seen_tabs.contains(&handle.window_id()) {
+                continue;
+            }
+
+            let Ok(Some(tabs)) = handle.update(cx, |_, window, _| {
+                if !window.system_window_tab_participant() {
+                    return None;
+                }
+
+                Some(window.tabbed_windows().unwrap_or_else(|| {
+                    vec![SystemWindowTab::new(
+                        SharedString::from(window.window_title()),
+                        window.window_handle(),
+                    )]
+                }))
+            }) else {
+                continue;
+            };
+
+            seen_tabs.extend(tabs.iter().map(|tab| tab.id));
+            Self::sync_tab_group(cx, handle.window_id(), tabs);
+        }
+    }
+
+    /// Merges every eligible window into the native tab group for `target_id`.
+    pub fn merge_all_window_tabs(cx: &mut App, target_id: WindowId) {
+        let windows = cx.windows();
+        let target = windows
+            .iter()
+            .find(|handle| handle.window_id() == target_id)
+            .copied()
+            .or_else(|| {
+                windows.iter().find_map(|handle| {
+                    handle
+                        .update(cx, |_, window, _| window.system_window_tab_participant())
+                        .ok()
+                        .and_then(|participates| participates.then_some(*handle))
+                })
+            });
+        let Some(target) = target else {
             return;
         };
 
-        let mut expected_tab_ids: Vec<_> = tabs
-            .iter()
-            .filter(|tab| tab.id != id)
-            .map(|tab| tab.id)
-            .sorted()
-            .collect();
+        let target_participates = target
+            .update(cx, |_, window, _| window.system_window_tab_participant())
+            .unwrap_or(false);
+        if !target_participates {
+            return;
+        }
 
-        let mut tab_group_id = None;
-        for (group_id, group_tabs) in &controller.tab_groups {
-            let tab_ids: Vec<_> = group_tabs.iter().map(|tab| tab.id).sorted().collect();
-            if tab_ids == expected_tab_ids {
-                tab_group_id = Some(*group_id);
-                break;
+        for window in windows {
+            if window == target {
+                continue;
+            }
+
+            let participates = window
+                .update(cx, |_, window, _| window.system_window_tab_participant())
+                .unwrap_or(false);
+            if participates {
+                cx.add_window_tab(target, window);
             }
         }
 
-        if let Some(tab_group_id) = tab_group_id {
-            if let Some(tabs) = controller.tab_groups.get_mut(&tab_group_id) {
-                tabs.push(tab);
-            }
-        } else {
-            let new_group_id = controller.tab_groups.len();
-            controller.tab_groups.insert(new_group_id, tabs);
+        Self::sync_all_window_tab_groups(cx);
+    }
+
+    fn sync_tab_group_by_id(&mut self, id: WindowId, mut tabs: Vec<SystemWindowTab>) {
+        if !tabs.iter().any(|tab| tab.id == id) {
+            return;
         }
+
+        let mut incoming_tab_ids = FxHashSet::default();
+        tabs.retain(|tab| incoming_tab_ids.insert(tab.id));
+
+        for tab in &mut tabs {
+            if let Some(existing_tab) = self
+                .tab_groups
+                .values()
+                .flat_map(|tabs| tabs.iter())
+                .find(|existing_tab| existing_tab.id == tab.id)
+            {
+                tab.last_active_at = existing_tab.last_active_at;
+            }
+        }
+
+        self.tab_groups.retain(|_, group_tabs| {
+            group_tabs.retain(|tab| !incoming_tab_ids.contains(&tab.id));
+            !group_tabs.is_empty()
+        });
+
+        let new_group_id = self
+            .tab_groups
+            .keys()
+            .max()
+            .map_or(0, |group_id| group_id + 1);
+        self.tab_groups.insert(new_group_id, tabs);
     }
 
     /// Remove a tab from a tab group.
@@ -581,35 +656,6 @@ impl SystemWindowTabController {
         });
 
         removed_tab
-    }
-
-    /// Move a tab to a new tab group.
-    pub fn move_tab_to_new_window(cx: &mut App, id: WindowId) {
-        let mut removed_tab = Self::remove_tab(cx, id);
-        let mut controller = cx.global_mut::<SystemWindowTabController>();
-
-        if let Some(tab) = removed_tab {
-            let new_group_id = controller.tab_groups.keys().max().map_or(0, |k| k + 1);
-            controller.tab_groups.insert(new_group_id, vec![tab]);
-        }
-    }
-
-    /// Merge all tab groups into a single group.
-    pub fn merge_all_windows(cx: &mut App, id: WindowId) {
-        let mut controller = cx.global_mut::<SystemWindowTabController>();
-        let Some(initial_tabs) = controller.tabs(id) else {
-            return;
-        };
-
-        let initial_tabs_len = initial_tabs.len();
-        let mut all_tabs = initial_tabs.clone();
-
-        for (_, mut tabs) in controller.tab_groups.drain() {
-            tabs.retain(|tab| !all_tabs[..initial_tabs_len].contains(tab));
-            all_tabs.extend(tabs);
-        }
-
-        controller.tab_groups.insert(0, all_tabs);
     }
 
     /// Selects the next tab in the tab group in the trailing direction.
@@ -1187,6 +1233,11 @@ impl App {
     /// This method returns None if the platform doesn't implement the method yet.
     pub fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
         self.platform.window_stack()
+    }
+
+    /// Adds `window` as a native tab of `target` when the platform supports native window tabs.
+    pub fn add_window_tab(&self, target: AnyWindowHandle, window: AnyWindowHandle) {
+        self.platform.add_tabbed_window(target, window);
     }
 
     /// Returns a handle to the window that is currently focused at the platform level, if one exists.
@@ -2256,6 +2307,11 @@ impl App {
         self.platform.set_menus(menus, &self.keymap.borrow());
     }
 
+    /// Enables or disables automatic window tabbing at the platform level.
+    pub fn set_automatic_window_tabbing(&self, enabled: bool) {
+        self.platform.set_automatic_window_tabbing(enabled);
+    }
+
     /// Gets the menu bar for this application.
     pub fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
         self.platform.get_menus()
@@ -2851,7 +2907,133 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
 mod test {
     use std::{cell::RefCell, rc::Rc};
 
-    use crate::{AppContext, TestAppContext};
+    use collections::FxHashSet;
+
+    use crate::{
+        AppContext, EmptyView, SharedString, SystemWindowTab, SystemWindowTabController,
+        TestAppContext, WindowHandle, WindowId,
+    };
+
+    fn test_tab(id: u64, title: &str) -> SystemWindowTab {
+        SystemWindowTab::new(
+            SharedString::from(title),
+            WindowHandle::<EmptyView>::new(WindowId::from(id)).into(),
+        )
+    }
+
+    fn assert_unique_tab_membership(controller: &SystemWindowTabController) {
+        let mut seen_ids = FxHashSet::default();
+        for tab in controller.tab_groups.values().flat_map(|tabs| tabs.iter()) {
+            assert!(
+                seen_ids.insert(tab.id),
+                "window id {} appeared in more than one tab group",
+                tab.id.as_u64()
+            );
+        }
+    }
+
+    fn tab_ids(tabs: &[SystemWindowTab]) -> Vec<WindowId> {
+        tabs.iter().map(|tab| tab.id).collect()
+    }
+
+    #[test]
+    fn sync_tab_group_replaces_stale_memberships() {
+        let mut controller = SystemWindowTabController::new();
+        controller.tab_groups.insert(0, vec![test_tab(1, "a")]);
+        controller.tab_groups.insert(1, vec![test_tab(2, "b")]);
+
+        controller
+            .sync_tab_group_by_id(WindowId::from(1), vec![test_tab(1, "a"), test_tab(2, "b")]);
+
+        assert_eq!(controller.tab_groups.len(), 1);
+        let tabs = controller.tabs(WindowId::from(1)).unwrap();
+        assert_eq!(tab_ids(tabs), vec![WindowId::from(1), WindowId::from(2)]);
+        assert_eq!(
+            tab_ids(controller.tabs(WindowId::from(2)).unwrap()),
+            tab_ids(tabs)
+        );
+        assert_unique_tab_membership(&controller);
+    }
+
+    #[test]
+    fn sync_tab_group_preserves_unrelated_tabs() {
+        let mut controller = SystemWindowTabController::new();
+        controller
+            .tab_groups
+            .insert(0, vec![test_tab(1, "a"), test_tab(3, "c")]);
+
+        controller
+            .sync_tab_group_by_id(WindowId::from(1), vec![test_tab(1, "a"), test_tab(2, "b")]);
+
+        let synced_tabs = controller.tabs(WindowId::from(1)).unwrap();
+        assert_eq!(
+            tab_ids(synced_tabs),
+            vec![WindowId::from(1), WindowId::from(2)]
+        );
+        let unrelated_tabs = controller.tabs(WindowId::from(3)).unwrap();
+        assert_eq!(tab_ids(unrelated_tabs), vec![WindowId::from(3)]);
+        assert_unique_tab_membership(&controller);
+    }
+
+    #[test]
+    fn sync_tab_group_preserves_last_active_at_for_known_tabs() {
+        let mut controller = SystemWindowTabController::new();
+        let original_tab = test_tab(1, "old title");
+        let original_last_active_at = original_tab.last_active_at;
+        controller.tab_groups.insert(0, vec![original_tab]);
+
+        controller.sync_tab_group_by_id(WindowId::from(1), vec![test_tab(1, "new title")]);
+
+        let tab = controller.tabs(WindowId::from(1)).unwrap().first().unwrap();
+        assert_eq!(tab.title, SharedString::from("new title"));
+        assert_eq!(tab.last_active_at, original_last_active_at);
+    }
+
+    #[test]
+    fn sync_tab_group_moves_tab_to_singleton_group() {
+        let mut controller = SystemWindowTabController::new();
+        controller
+            .tab_groups
+            .insert(0, vec![test_tab(1, "a"), test_tab(2, "b")]);
+
+        controller.sync_tab_group_by_id(WindowId::from(2), vec![test_tab(2, "b")]);
+
+        assert_eq!(
+            tab_ids(controller.tabs(WindowId::from(1)).unwrap()),
+            vec![WindowId::from(1)]
+        );
+        assert_eq!(
+            tab_ids(controller.tabs(WindowId::from(2)).unwrap()),
+            vec![WindowId::from(2)]
+        );
+        assert_unique_tab_membership(&controller);
+    }
+
+    #[test]
+    fn next_and_previous_tab_group_windows_use_stable_group_order() {
+        let cx = TestAppContext::single();
+
+        cx.update(|cx| {
+            let mut controller = SystemWindowTabController::new();
+            controller.tab_groups.insert(20, vec![test_tab(20, "c")]);
+            controller.tab_groups.insert(5, vec![test_tab(5, "a")]);
+            controller.tab_groups.insert(10, vec![test_tab(10, "b")]);
+            cx.set_global(controller);
+
+            assert_eq!(
+                SystemWindowTabController::get_next_tab_group_window(cx, WindowId::from(5))
+                    .unwrap()
+                    .window_id(),
+                WindowId::from(10)
+            );
+            assert_eq!(
+                SystemWindowTabController::get_prev_tab_group_window(cx, WindowId::from(5))
+                    .unwrap()
+                    .window_id(),
+                WindowId::from(20)
+            );
+        });
+    }
 
     #[test]
     fn test_gpui_borrow() {
