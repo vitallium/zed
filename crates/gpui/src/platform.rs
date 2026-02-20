@@ -151,6 +151,9 @@ pub trait Platform: 'static {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
 
+    /// Controls whether the platform should allow automatic window tabbing globally
+    fn set_automatic_window_tabbing(&self, _enabled: bool) {}
+
     /// Returns the appearance of the application's windows.
     fn window_appearance(&self) -> WindowAppearance;
 

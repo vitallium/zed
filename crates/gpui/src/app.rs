@@ -492,11 +492,10 @@ impl SystemWindowTabController {
             return;
         };
 
-        let initial_tabs_len = initial_tabs.len();
         let mut all_tabs = initial_tabs.clone();
 
         for (_, mut tabs) in controller.tab_groups.drain() {
-            tabs.retain(|tab| !all_tabs[..initial_tabs_len].contains(tab));
+            tabs.retain(|tab| !all_tabs.contains(tab));
             all_tabs.extend(tabs);
         }
 
@@ -2009,6 +2008,11 @@ impl App {
     /// Sets the menu bar for this application. This will replace any existing menu bar.
     pub fn set_menus(&self, menus: Vec<Menu>) {
         self.platform.set_menus(menus, &self.keymap.borrow());
+    }
+
+    /// Enables or disables automatic window tabbing at the platform level.
+    pub fn set_automatic_window_tabbing(&self, enabled: bool) {
+        self.platform.set_automatic_window_tabbing(enabled);
     }
 
     /// Gets the menu bar for this application.

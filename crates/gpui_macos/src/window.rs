@@ -95,6 +95,7 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
+
 #[derive(PartialEq)]
 pub enum UserTabbingPreference {
     Never,
@@ -613,13 +614,7 @@ impl MacWindow {
     ) -> Self {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
-
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
-            if allows_automatic_window_tabbing {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
-            } else {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
-            }
 
             let mut style_mask;
             if let Some(titlebar) = titlebar.as_ref() {
@@ -886,20 +881,17 @@ impl MacWindow {
                 let should_add_as_tab = user_tabbing_preference == UserTabbingPreference::Always
                     || user_tabbing_preference == UserTabbingPreference::InFullScreen
                         && main_window_is_fullscreen;
+                let main_window_can_tab: BOOL =
+                    msg_send![main_window, respondsToSelector: sel!(addTabbedWindow:ordered:)];
+                let main_window_visible: BOOL = msg_send![main_window, isVisible];
 
-                if should_add_as_tab {
-                    let main_window_can_tab: BOOL =
-                        msg_send![main_window, respondsToSelector: sel!(addTabbedWindow:ordered:)];
-                    let main_window_visible: BOOL = msg_send![main_window, isVisible];
+                if should_add_as_tab && main_window_can_tab == YES && main_window_visible == YES {
+                    let _: () = msg_send![main_window, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
 
-                    if main_window_can_tab == YES && main_window_visible == YES {
-                        let _: () = msg_send![main_window, addTabbedWindow: native_window ordered: NSWindowOrderingMode::NSWindowAbove];
-
-                        // Ensure the window is visible immediately after adding the tab, since the tab bar is updated with a new entry at this point.
-                        // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the main window is not fullscreen.
-                        if !main_window_is_fullscreen {
-                            let _: () = msg_send![native_window, orderFront: nil];
-                        }
+                    // Ensure the window is visible immediately after adding the tab, since the tab bar is updated with a new entry at this point.
+                    // Note: Calling orderFront here can break fullscreen mode (makes fullscreen windows exit fullscreen), so only do this if the main window is not fullscreen.
+                    if !main_window_is_fullscreen {
+                        let _: () = msg_send![native_window, orderFront: nil];
                     }
                 }
             }
@@ -1091,13 +1083,6 @@ impl PlatformWindow for MacWindow {
     fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
         let native_window = self.0.lock().native_window;
         unsafe {
-            let allows_automatic_window_tabbing = tabbing_identifier.is_some();
-            if allows_automatic_window_tabbing {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
-            } else {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
-            }
-
             if let Some(tabbing_identifier) = tabbing_identifier {
                 let tabbing_id = ns_string(tabbing_identifier.as_str());
                 let _: () = msg_send![native_window, setTabbingIdentifier: tabbing_id];

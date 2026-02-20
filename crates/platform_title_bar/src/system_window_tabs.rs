@@ -55,12 +55,14 @@ impl SystemWindowTabs {
     pub fn init(cx: &mut App) {
         let mut was_use_system_window_tabs =
             WorkspaceSettings::get_global(cx).use_system_window_tabs;
+        cx.set_automatic_window_tabbing(was_use_system_window_tabs);
 
         cx.observe_global::<SettingsStore>(move |cx| {
             let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
             if use_system_window_tabs == was_use_system_window_tabs {
                 return;
             }
+            cx.set_automatic_window_tabbing(use_system_window_tabs);
             was_use_system_window_tabs = use_system_window_tabs;
 
             let tabbing_identifier = if use_system_window_tabs {

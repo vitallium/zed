@@ -1336,7 +1336,14 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move || {
                 handle
-                    .update(&mut cx, |_, _window, cx| {
+                    .update(&mut cx, |_, window, cx| {
+                        let tabs = window.tabbed_windows().unwrap_or_else(|| {
+                            vec![SystemWindowTab::new(
+                                SharedString::from(window.window_title()),
+                                window.handle,
+                            )]
+                        });
+                        SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
                         SystemWindowTabController::merge_all_windows(cx, handle.window_id());
                     })
                     .log_err();

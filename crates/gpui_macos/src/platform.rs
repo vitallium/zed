@@ -622,6 +622,13 @@ impl Platform for MacPlatform {
         )))
     }
 
+    fn set_automatic_window_tabbing(&self, enabled: bool) {
+        unsafe {
+            let value = if enabled { YES } else { NO };
+            let _: () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: value];
+        }
+    }
+
     fn window_appearance(&self) -> WindowAppearance {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
