@@ -1052,7 +1052,7 @@ impl LspCommand for GetTypeDefinitions {
     }
 }
 
-fn language_server_for_buffer(
+pub(crate) fn language_server_for_buffer(
     lsp_store: &Entity<LspStore>,
     buffer: &Entity<Buffer>,
     server_id: LanguageServerId,

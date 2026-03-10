@@ -4322,6 +4322,17 @@ impl Project {
         })
     }
 
+    pub fn toggle_comments_via_lsp(
+        &mut self,
+        buffer: Entity<Buffer>,
+        selections: Vec<Range<text::Anchor>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Transaction>>> {
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.toggle_comments_via_lsp(buffer, selections, cx)
+        })
+    }
+
     pub fn inline_values(
         &mut self,
         session: Entity<Session>,

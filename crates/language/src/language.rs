@@ -887,6 +887,9 @@ pub struct LanguageConfig {
     /// Delimiters and configuration for recognizing and formatting block comments.
     #[serde(default)]
     pub block_comment: Option<BlockCommentConfig>,
+    /// Configuration for inline/delimiter-mutation comments (e.g., ERB `<%` → `<%#`).
+    #[serde(default)]
+    pub inline_comment: Option<InlineCommentConfig>,
     /// Delimiters and configuration for recognizing and formatting documentation comments.
     #[serde(default, alias = "documentation")]
     pub documentation_comment: Option<BlockCommentConfig>,
@@ -1089,6 +1092,26 @@ impl<'de> Deserialize<'de> for BlockCommentConfig {
     }
 }
 
+/// Configuration for inline/delimiter-mutation comments used by template
+/// languages like ERB, EJS, and EEx.
+///
+/// Unlike block comments (which wrap content with prefix/suffix), inline
+/// comments work by mutating an existing delimiter on the line. For example,
+/// ERB's `<% code %>` becomes `<%# code %>` by replacing `<%` with `<%#`.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
+pub struct InlineCommentConfig {
+    /// The opening delimiter to find (e.g., `<%`).
+    pub start: Arc<str>,
+    /// The commented form of the opening delimiter (e.g., `<%#`).
+    pub comment_start: Arc<str>,
+    /// The closing delimiter to find, if it also changes (e.g., `%>`).
+    #[serde(default)]
+    pub end: Option<Arc<str>>,
+    /// The commented form of the closing delimiter (e.g., `--%>`).
+    #[serde(default)]
+    pub comment_end: Option<Arc<str>>,
+}
+
 /// Represents a language for the given range. Some languages (e.g. HTML)
 /// interleave several languages together, thus a single buffer might actually contain
 /// several nested scopes.
@@ -1104,6 +1127,8 @@ pub struct LanguageConfigOverride {
     pub line_comments: Override<Vec<Arc<str>>>,
     #[serde(default)]
     pub block_comment: Override<BlockCommentConfig>,
+    #[serde(default)]
+    pub inline_comment: Override<InlineCommentConfig>,
     #[serde(skip)]
     pub disabled_bracket_ixs: Vec<u16>,
     #[serde(default)]
@@ -1158,6 +1183,7 @@ impl Default for LanguageConfig {
             autoclose_before: Default::default(),
             line_comments: Default::default(),
             block_comment: Default::default(),
+            inline_comment: Default::default(),
             documentation_comment: Default::default(),
             unordered_list: Default::default(),
             ordered_list: Default::default(),
@@ -2207,6 +2233,14 @@ impl LanguageScope {
         Override::as_option(
             self.config_override().map(|o| &o.block_comment),
             self.language.config.block_comment.as_ref(),
+        )
+    }
+
+    /// Config for inline/delimiter-mutation comments for this language.
+    pub fn inline_comment(&self) -> Option<&InlineCommentConfig> {
+        Override::as_option(
+            self.config_override().map(|o| &o.inline_comment),
+            self.language.config.inline_comment.as_ref(),
         )
     }
 

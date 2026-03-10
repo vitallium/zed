@@ -1,30 +1,31 @@
 use crate::{
     LocationLink,
     lsp_command::{
-        LspCommand, file_path_to_lsp_url, location_link_from_lsp, location_link_from_proto,
-        location_link_to_proto, location_links_from_lsp, location_links_from_proto,
-        location_links_to_proto,
+        LspCommand, file_path_to_lsp_url, language_server_for_buffer, location_link_from_lsp,
+        location_link_from_proto, location_link_to_proto, location_links_from_lsp,
+        location_links_from_proto, location_links_to_proto, make_text_document_identifier,
     },
-    lsp_store::LspStore,
-    make_lsp_text_document_position, make_text_document_identifier,
+    lsp_store::{LocalLspStore, LspStore},
+    make_lsp_text_document_position,
 };
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use collections::HashMap;
 use gpui::{App, AsyncApp, Entity};
 use language::{
-    Buffer, point_to_lsp,
-    proto::{deserialize_anchor, serialize_anchor},
+    Buffer, Transaction, point_to_lsp,
+    proto::{deserialize_anchor, deserialize_version, serialize_anchor, serialize_version},
 };
 use lsp::{AdapterServerCapabilities, LanguageServer, LanguageServerId};
 use rpc::proto::{self, PeerId};
 use serde::{Deserialize, Serialize};
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use task::TaskTemplate;
-use text::{BufferId, PointUtf16, ToPointUtf16};
+use text::{Anchor, BufferId, PointUtf16, ToPointUtf16};
 
 pub enum LspExtExpandMacro {}
 
@@ -803,4 +804,168 @@ pub struct RunFlycheckParams {
 impl lsp::notification::Notification for LspExtClearFlycheck {
     type Params = ();
     const METHOD: &'static str = "rust-analyzer/clearFlycheck";
+}
+
+pub enum LspExtToggleComments {}
+
+impl lsp::request::Request for LspExtToggleComments {
+    type Params = ToggleCommentsParams;
+    type Result = Option<Vec<lsp::TextEdit>>;
+    const METHOD: &'static str = "herb/toggleLineComment";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ToggleCommentsParams {
+    pub text_document: lsp::TextDocumentIdentifier,
+    pub ranges: Vec<lsp::Range>,
+}
+
+#[derive(Debug)]
+pub struct ToggleCommentsCommand {
+    pub selections: Vec<Range<Anchor>>,
+}
+
+#[async_trait(?Send)]
+impl LspCommand for ToggleCommentsCommand {
+    type Response = Option<Transaction>;
+    type LspRequest = LspExtToggleComments;
+    type ProtoRequest = proto::ToggleComments;
+
+    fn display_name(&self) -> &str {
+        "Toggle comments"
+    }
+
+    fn check_capabilities(&self, _capabilities: AdapterServerCapabilities) -> bool {
+        true
+    }
+
+    fn to_lsp(
+        &self,
+        path: &Path,
+        buffer: &Buffer,
+        _language_server: &Arc<LanguageServer>,
+        _cx: &App,
+    ) -> Result<ToggleCommentsParams> {
+        let ranges = self
+            .selections
+            .iter()
+            .map(|selection| {
+                let start = selection.start.to_point_utf16(buffer);
+                let end = selection.end.to_point_utf16(buffer);
+                lsp::Range {
+                    start: point_to_lsp(start),
+                    end: point_to_lsp(end),
+                }
+            })
+            .collect();
+
+        Ok(ToggleCommentsParams {
+            text_document: make_text_document_identifier(path)?,
+            ranges,
+        })
+    }
+
+    async fn response_from_lsp(
+        self,
+        message: Option<Vec<lsp::TextEdit>>,
+        lsp_store: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        server_id: LanguageServerId,
+        mut cx: AsyncApp,
+    ) -> Result<Option<Transaction>> {
+        if let Some(edits) = message {
+            let (lsp_adapter, lsp_server) =
+                language_server_for_buffer(&lsp_store, &buffer, server_id, &mut cx)?;
+            LocalLspStore::deserialize_text_edits(
+                lsp_store,
+                buffer,
+                edits,
+                true,
+                lsp_adapter,
+                lsp_server,
+                &mut cx,
+            )
+            .await
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::ToggleComments {
+        let starts = self
+            .selections
+            .iter()
+            .map(|s| serialize_anchor(&s.start))
+            .collect();
+        let ends = self
+            .selections
+            .iter()
+            .map(|s| serialize_anchor(&s.end))
+            .collect();
+
+        proto::ToggleComments {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            starts,
+            ends,
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::ToggleComments,
+        _: Entity<LspStore>,
+        buffer: Entity<Buffer>,
+        mut cx: AsyncApp,
+    ) -> Result<Self> {
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })
+            .await?;
+
+        let selections = message
+            .starts
+            .iter()
+            .zip(message.ends.iter())
+            .map(|(start, end)| {
+                let start = deserialize_anchor(start.clone()).context("invalid start anchor")?;
+                let end = deserialize_anchor(end.clone()).context("invalid end anchor")?;
+                Ok(start..end)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self { selections })
+    }
+
+    fn response_to_proto(
+        response: Option<Transaction>,
+        _: &mut LspStore,
+        _: PeerId,
+        _: &clock::Global,
+        _: &mut App,
+    ) -> proto::ToggleCommentsResponse {
+        proto::ToggleCommentsResponse {
+            transaction: response
+                .map(|transaction| language::proto::serialize_transaction(&transaction)),
+        }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::ToggleCommentsResponse,
+        _: Entity<LspStore>,
+        _: Entity<Buffer>,
+        _: AsyncApp,
+    ) -> Result<Option<Transaction>> {
+        let Some(transaction) = message.transaction else {
+            return Ok(None);
+        };
+        Ok(Some(language::proto::deserialize_transaction(transaction)?))
+    }
+
+    fn buffer_id_from_proto(message: &proto::ToggleComments) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
 }

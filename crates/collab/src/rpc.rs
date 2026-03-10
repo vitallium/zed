@@ -352,6 +352,7 @@ impl Server {
                 forward_mutating_project_request::<proto::ExpandAllForProjectEntry>,
             )
             .add_request_handler(forward_mutating_project_request::<proto::OnTypeFormatting>)
+            .add_request_handler(forward_mutating_project_request::<proto::ToggleComments>)
             .add_request_handler(forward_mutating_project_request::<proto::SaveBuffer>)
             .add_request_handler(forward_mutating_project_request::<proto::BlameBuffer>)
             .add_request_handler(lsp_query)

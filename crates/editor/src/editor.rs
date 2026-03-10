@@ -16195,6 +16195,69 @@ impl Editor {
         Ok(())
     }
 
+    fn try_toggle_comments_via_lsp(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        let project = self.project.as_ref()?.clone();
+        let snapshot = self.display_snapshot(cx);
+        let selections = self.selections.all::<MultiBufferPoint>(&snapshot);
+        drop(snapshot);
+
+        let mut buffer_selections: Vec<(Entity<language::Buffer>, Vec<Range<text::Anchor>>)> =
+            Vec::new();
+        {
+            let multibuffer = self.buffer.read(cx);
+            for selection in &selections {
+                let (buffer, start) = multibuffer.text_anchor_for_position(selection.start, cx)?;
+                let (_, end) = multibuffer.text_anchor_for_position(selection.end, cx)?;
+                if let Some((last_buf, ranges)) = buffer_selections.last_mut() {
+                    if last_buf.entity_id() == buffer.entity_id() {
+                        ranges.push(start..end);
+                        continue;
+                    }
+                }
+                buffer_selections.push((buffer, vec![start..end]));
+            }
+        }
+
+        if buffer_selections.len() != 1 {
+            return None;
+        }
+
+        let (buffer, ranges) = buffer_selections.into_iter().next()?;
+
+        // let supports = project
+        //     .read(cx)
+        //     .lsp_store()
+        //     .read(cx)
+        //     .supports_toggle_comments_lsp();
+        // println!("supports {:?}", supports);
+        // if !supports {
+        //     return None;
+        // }
+
+        let task = project.update(cx, |project, cx| {
+            println!("try_toggle_comments_via_lsp");
+            project.toggle_comments_via_lsp(buffer.clone(), ranges, cx)
+        });
+
+        let buffer_handle = buffer;
+        Some(cx.spawn_in(window, async move |editor, cx| {
+            if let Some(transaction) = task.await? {
+                buffer_handle.update(cx, |buffer, _| {
+                    buffer.push_transaction(transaction, Instant::now());
+                    buffer.finalize_last_transaction();
+                });
+                editor.update(cx, |editor, cx| {
+                    editor.refresh_document_highlights(cx);
+                })?;
+            }
+            Ok(())
+        }))
+    }
+
     pub fn toggle_comments(
         &mut self,
         action: &ToggleComments,
@@ -16204,6 +16267,21 @@ impl Editor {
         if self.read_only(cx) {
             return;
         }
+
+        if let Some(task) = self.try_toggle_comments_via_lsp(window, cx) {
+            task.detach_and_log_err(cx);
+            return;
+        }
+
+        self.toggle_comments_local(action, window, cx);
+    }
+
+    fn toggle_comments_local(
+        &mut self,
+        action: &ToggleComments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.hide_mouse_cursor(HideMouseCursorOrigin::TypingAction, cx);
         let text_layout_details = &self.text_layout_details(window, cx);
         self.transact(window, cx, |this, window, cx| {
@@ -16293,21 +16371,7 @@ impl Editor {
                 }
             }
 
-            // TODO: Handle selections that cross excerpts
             for selection in &mut selections {
-                let start_column = snapshot
-                    .indent_size_for_line(MultiBufferRow(selection.start.row))
-                    .len;
-                let language = if let Some(language) =
-                    snapshot.language_scope_at(Point::new(selection.start.row, start_column))
-                {
-                    language
-                } else {
-                    continue;
-                };
-
-                selection_edit_ranges.clear();
-
                 // If multiple selections contain a given row, avoid processing that
                 // row more than once.
                 let mut start_row = MultiBufferRow(selection.start.row);
@@ -16326,109 +16390,316 @@ impl Editor {
                     continue;
                 }
 
-                // If the language has line comments, toggle those.
-                let mut full_comment_prefixes = language.line_comment_prefixes().to_vec();
-
-                // If ignore_indent is set, trim spaces from the right side of all full_comment_prefixes
-                if ignore_indent {
-                    full_comment_prefixes = full_comment_prefixes
-                        .into_iter()
-                        .map(|s| Arc::from(s.trim_end()))
-                        .collect();
+                // Resolve per-row language scope and comment config.
+                enum RowCommentKind {
+                    Line(SmallVec<[Arc<str>; 4]>),
+                    Block { start: Arc<str>, end: Arc<str> },
+                    Inline(language::InlineCommentConfig),
                 }
 
-                if !full_comment_prefixes.is_empty() {
-                    let first_prefix = full_comment_prefixes
-                        .first()
-                        .expect("prefixes is non-empty");
-                    let prefix_trimmed_lengths = full_comment_prefixes
-                        .iter()
-                        .map(|p| p.trim_end_matches(' ').len())
-                        .collect::<SmallVec<[usize; 4]>>();
+                // Find the byte offset of `needle` within the given row.
+                // Returns the column (byte offset from line start) if found.
+                fn find_on_line(
+                    snapshot: &MultiBufferSnapshot,
+                    row: MultiBufferRow,
+                    needle: &str,
+                ) -> Option<u32> {
+                    let line_start = Point::new(row.0, 0);
+                    let line_end = Point::new(row.0, snapshot.line_len(row));
+                    let line_bytes: Vec<u8> = snapshot
+                        .bytes_in_range(line_start..line_end)
+                        .flatten()
+                        .copied()
+                        .collect();
+                    let needle_bytes = needle.as_bytes();
+                    line_bytes
+                        .windows(needle_bytes.len())
+                        .position(|w| w == needle_bytes)
+                        .map(|p| p as u32)
+                }
 
-                    let mut all_selection_lines_are_comments = true;
+                // Find the last byte offset of `needle` within the given row.
+                fn rfind_on_line(
+                    snapshot: &MultiBufferSnapshot,
+                    row: MultiBufferRow,
+                    needle: &str,
+                ) -> Option<u32> {
+                    let line_start = Point::new(row.0, 0);
+                    let line_end = Point::new(row.0, snapshot.line_len(row));
+                    let line_bytes: Vec<u8> = snapshot
+                        .bytes_in_range(line_start..line_end)
+                        .flatten()
+                        .copied()
+                        .collect();
+                    let needle_bytes = needle.as_bytes();
+                    line_bytes
+                        .windows(needle_bytes.len())
+                        .rposition(|w| w == needle_bytes)
+                        .map(|p| p as u32)
+                }
 
-                    for row in start_row.0..=end_row.0 {
-                        let row = MultiBufferRow(row);
-                        if start_row < end_row && snapshot.is_line_blank(row) {
-                            continue;
-                        }
+                let mut row_configs: SmallVec<[(MultiBufferRow, RowCommentKind); 8]> =
+                    SmallVec::new();
 
-                        let prefix_range = full_comment_prefixes
-                            .iter()
-                            .zip(prefix_trimmed_lengths.iter().copied())
-                            .map(|(prefix, trimmed_prefix_len)| {
-                                comment_prefix_range(
-                                    snapshot.deref(),
-                                    row,
-                                    &prefix[..trimmed_prefix_len],
-                                    &prefix[trimmed_prefix_len..],
-                                    ignore_indent,
-                                )
-                            })
-                            .max_by_key(|range| range.end.column - range.start.column)
-                            .expect("prefixes is non-empty");
-
-                        if prefix_range.is_empty() {
-                            all_selection_lines_are_comments = false;
-                        }
-
-                        selection_edit_ranges.push(prefix_range);
+                for row_idx in start_row.0..=end_row.0 {
+                    let row = MultiBufferRow(row_idx);
+                    if start_row < end_row && snapshot.is_line_blank(row) {
+                        continue;
                     }
 
-                    if all_selection_lines_are_comments {
-                        edits.extend(
-                            selection_edit_ranges
-                                .iter()
-                                .cloned()
-                                .map(|range| (range, empty_str.clone())),
-                        );
+                    let indent = snapshot.indent_size_for_line(row).len;
+                    let language = if let Some(language) =
+                        snapshot.language_scope_at(Point::new(row_idx, indent))
+                    {
+                        language
                     } else {
+                        continue;
+                    };
+
+                    // Inline comments take priority when the line contains the
+                    // delimiter (either the normal or commented form).
+                    if let Some(inline_config) = language.inline_comment() {
+                        let has_start =
+                            find_on_line(snapshot.deref(), row, &inline_config.start).is_some();
+                        let has_comment_start =
+                            find_on_line(snapshot.deref(), row, &inline_config.comment_start)
+                                .is_some();
+                        if has_start || has_comment_start {
+                            row_configs.push((row, RowCommentKind::Inline(inline_config.clone())));
+                            continue;
+                        }
+                    }
+
+                    let mut line_prefixes = language.line_comment_prefixes().to_vec();
+                    if ignore_indent {
+                        line_prefixes = line_prefixes
+                            .into_iter()
+                            .map(|s| Arc::from(s.trim_end()))
+                            .collect();
+                    }
+
+                    if !line_prefixes.is_empty() {
+                        row_configs
+                            .push((row, RowCommentKind::Line(SmallVec::from_vec(line_prefixes))));
+                    } else if let Some(BlockCommentConfig {
+                        start: block_start,
+                        end: block_end,
+                        ..
+                    }) = language.block_comment()
+                    {
+                        row_configs.push((
+                            row,
+                            RowCommentKind::Block {
+                                start: block_start.clone(),
+                                end: block_end.clone(),
+                            },
+                        ));
+                    }
+                }
+
+                if row_configs.is_empty() {
+                    continue;
+                }
+
+                // Phase 1: Determine per-row commented status.
+                let row_is_commented: SmallVec<[bool; 8]> = row_configs
+                    .iter()
+                    .map(|(row, kind)| match kind {
+                        RowCommentKind::Line(prefixes) => {
+                            let prefix_trimmed_lengths: SmallVec<[usize; 4]> = prefixes
+                                .iter()
+                                .map(|p| p.trim_end_matches(' ').len())
+                                .collect();
+                            let prefix_range = prefixes
+                                .iter()
+                                .zip(prefix_trimmed_lengths.iter().copied())
+                                .map(|(prefix, trimmed_len)| {
+                                    comment_prefix_range(
+                                        snapshot.deref(),
+                                        *row,
+                                        &prefix[..trimmed_len],
+                                        &prefix[trimmed_len..],
+                                        ignore_indent,
+                                    )
+                                })
+                                .max_by_key(|range| range.end.column - range.start.column)
+                                .expect("prefixes is non-empty");
+                            !prefix_range.is_empty()
+                        }
+                        RowCommentKind::Block { start, end } => {
+                            let comment_prefix = start.trim_end_matches(' ');
+                            let comment_prefix_whitespace = &start[comment_prefix.len()..];
+                            let prefix_range = comment_prefix_range(
+                                snapshot.deref(),
+                                *row,
+                                comment_prefix,
+                                comment_prefix_whitespace,
+                                ignore_indent,
+                            );
+                            let suffix_range = comment_suffix_range(
+                                snapshot.deref(),
+                                *row,
+                                end.trim_start_matches(' '),
+                                end.starts_with(' '),
+                            );
+                            !prefix_range.is_empty() && !suffix_range.is_empty()
+                        }
+                        RowCommentKind::Inline(config) => {
+                            find_on_line(snapshot.deref(), *row, &config.comment_start).is_some()
+                        }
+                    })
+                    .collect();
+
+                let all_commented = row_is_commented.iter().all(|c| *c);
+
+                // Phase 2: Apply edits per-row.
+                selection_edit_ranges.clear();
+
+                let mut line_comment_rows: SmallVec<
+                    [(MultiBufferRow, SmallVec<[Arc<str>; 4]>); 8],
+                > = SmallVec::new();
+
+                if all_commented {
+                    for (row, kind) in &row_configs {
+                        match kind {
+                            RowCommentKind::Line(prefixes) => {
+                                let prefix_trimmed_lengths: SmallVec<[usize; 4]> = prefixes
+                                    .iter()
+                                    .map(|p| p.trim_end_matches(' ').len())
+                                    .collect();
+                                let prefix_range = prefixes
+                                    .iter()
+                                    .zip(prefix_trimmed_lengths.iter().copied())
+                                    .map(|(prefix, trimmed_len)| {
+                                        comment_prefix_range(
+                                            snapshot.deref(),
+                                            *row,
+                                            &prefix[..trimmed_len],
+                                            &prefix[trimmed_len..],
+                                            ignore_indent,
+                                        )
+                                    })
+                                    .max_by_key(|range| range.end.column - range.start.column)
+                                    .expect("prefixes is non-empty");
+                                edits.push((prefix_range, empty_str.clone()));
+                            }
+                            RowCommentKind::Block { start, end } => {
+                                let comment_prefix = start.trim_end_matches(' ');
+                                let comment_prefix_whitespace = &start[comment_prefix.len()..];
+                                let prefix_range = comment_prefix_range(
+                                    snapshot.deref(),
+                                    *row,
+                                    comment_prefix,
+                                    comment_prefix_whitespace,
+                                    ignore_indent,
+                                );
+                                let suffix_range = comment_suffix_range(
+                                    snapshot.deref(),
+                                    *row,
+                                    end.trim_start_matches(' '),
+                                    end.starts_with(' '),
+                                );
+                                edits.push((prefix_range, empty_str.clone()));
+                                edits.push((suffix_range, empty_str.clone()));
+                            }
+                            RowCommentKind::Inline(config) => {
+                                // Uncomment: replace comment_start → start
+                                if let Some(col) =
+                                    find_on_line(snapshot.deref(), *row, &config.comment_start)
+                                {
+                                    let start = Point::new(row.0, col);
+                                    let end =
+                                        Point::new(row.0, col + config.comment_start.len() as u32);
+                                    edits.push((start..end, config.start.clone()));
+                                }
+                                // Uncomment end delimiter if configured
+                                if let (Some(end_pattern), Some(comment_end)) =
+                                    (&config.end, &config.comment_end)
+                                {
+                                    if let Some(col) =
+                                        rfind_on_line(snapshot.deref(), *row, comment_end)
+                                    {
+                                        let start = Point::new(row.0, col);
+                                        let end = Point::new(row.0, col + comment_end.len() as u32);
+                                        edits.push((start..end, end_pattern.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for (row, kind) in &row_configs {
+                        match kind {
+                            RowCommentKind::Line(prefixes) => {
+                                let prefix_trimmed_lengths: SmallVec<[usize; 4]> = prefixes
+                                    .iter()
+                                    .map(|p| p.trim_end_matches(' ').len())
+                                    .collect();
+                                let prefix_range = prefixes
+                                    .iter()
+                                    .zip(prefix_trimmed_lengths.iter().copied())
+                                    .map(|(prefix, trimmed_len)| {
+                                        comment_prefix_range(
+                                            snapshot.deref(),
+                                            *row,
+                                            &prefix[..trimmed_len],
+                                            &prefix[trimmed_len..],
+                                            ignore_indent,
+                                        )
+                                    })
+                                    .max_by_key(|range| range.end.column - range.start.column)
+                                    .expect("prefixes is non-empty");
+
+                                line_comment_rows.push((*row, prefixes.clone()));
+                                selection_edit_ranges.push(prefix_range);
+                            }
+                            RowCommentKind::Block { start, end } => {
+                                let indent = snapshot.indent_size_for_line(*row).len;
+                                let start_pos = Point::new(row.0, indent);
+                                let end_pos = Point::new(row.0, snapshot.line_len(*row));
+                                edits.push((start_pos..start_pos, start.clone()));
+                                edits.push((end_pos..end_pos, end.clone()));
+                                suffixes_inserted.push((*row, end.len()));
+                            }
+                            RowCommentKind::Inline(config) => {
+                                // Comment: replace start → comment_start
+                                if let Some(col) =
+                                    find_on_line(snapshot.deref(), *row, &config.start)
+                                {
+                                    let start = Point::new(row.0, col);
+                                    let end = Point::new(row.0, col + config.start.len() as u32);
+                                    edits.push((start..end, config.comment_start.clone()));
+                                }
+                                // Comment end delimiter if configured
+                                if let (Some(end_pattern), Some(comment_end)) =
+                                    (&config.end, &config.comment_end)
+                                {
+                                    if let Some(col) =
+                                        rfind_on_line(snapshot.deref(), *row, end_pattern)
+                                    {
+                                        let start = Point::new(row.0, col);
+                                        let end = Point::new(row.0, col + end_pattern.len() as u32);
+                                        edits.push((start..end, comment_end.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // For line comments being added, align to the minimum column.
+                    if !line_comment_rows.is_empty() {
                         let min_column = selection_edit_ranges
                             .iter()
                             .map(|range| range.start.column)
                             .min()
                             .unwrap_or(0);
-                        edits.extend(selection_edit_ranges.iter().map(|range| {
+                        for (i, (_, prefixes)) in line_comment_rows.iter().enumerate() {
+                            let first_prefix = prefixes.first().expect("prefixes is non-empty");
+                            let range = &selection_edit_ranges[i];
                             let position = Point::new(range.start.row, min_column);
-                            (position..position, first_prefix.clone())
-                        }));
+                            edits.push((position..position, first_prefix.clone()));
+                        }
                     }
-                } else if let Some(BlockCommentConfig {
-                    start: full_comment_prefix,
-                    end: comment_suffix,
-                    ..
-                }) = language.block_comment()
-                {
-                    let comment_prefix = full_comment_prefix.trim_end_matches(' ');
-                    let comment_prefix_whitespace = &full_comment_prefix[comment_prefix.len()..];
-                    let prefix_range = comment_prefix_range(
-                        snapshot.deref(),
-                        start_row,
-                        comment_prefix,
-                        comment_prefix_whitespace,
-                        ignore_indent,
-                    );
-                    let suffix_range = comment_suffix_range(
-                        snapshot.deref(),
-                        end_row,
-                        comment_suffix.trim_start_matches(' '),
-                        comment_suffix.starts_with(' '),
-                    );
-
-                    if prefix_range.is_empty() || suffix_range.is_empty() {
-                        edits.push((
-                            prefix_range.start..prefix_range.start,
-                            full_comment_prefix.clone(),
-                        ));
-                        edits.push((suffix_range.end..suffix_range.end, comment_suffix.clone()));
-                        suffixes_inserted.push((end_row, comment_suffix.len()));
-                    } else {
-                        edits.push((prefix_range, empty_str.clone()));
-                        edits.push((suffix_range, empty_str.clone()));
-                    }
-                } else {
-                    continue;
                 }
             }
 

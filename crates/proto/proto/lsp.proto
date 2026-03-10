@@ -385,6 +385,18 @@ message OnTypeFormattingResponse {
   Transaction transaction = 1;
 }
 
+message ToggleComments {
+  uint64 project_id = 1;
+  uint64 buffer_id = 2;
+  repeated Anchor starts = 3;
+  repeated Anchor ends = 4;
+  repeated VectorClockEntry version = 5;
+}
+
+message ToggleCommentsResponse {
+  Transaction transaction = 1;
+}
+
 message LinkedEditingRange {
   uint64 project_id = 1;
   uint64 buffer_id = 2;

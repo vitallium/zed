@@ -14,6 +14,7 @@ mod code_lens;
 mod document_colors;
 mod document_symbols;
 mod folding_ranges;
+pub mod herb_language_server_ext;
 mod inlay_hints;
 pub mod json_language_server_ext;
 pub mod log_store;
@@ -4110,6 +4111,9 @@ impl LspStore {
         client.add_entity_request_handler(
             Self::handle_lsp_command::<lsp_ext_command::SwitchSourceHeader>,
         );
+        client.add_entity_request_handler(
+            Self::handle_lsp_command::<lsp_ext_command::ToggleCommentsCommand>,
+        );
     }
 
     pub fn as_remote(&self) -> Option<&RemoteLspStore> {
@@ -5668,6 +5672,31 @@ impl LspStore {
             })?
             .await
         })
+    }
+
+    pub fn supports_toggle_comments_lsp(&self) -> bool {
+        self.lsp_server_capabilities.values().any(|capabilities| {
+            capabilities
+                .experimental
+                .as_ref()
+                .and_then(|exp| exp.get("toggleComments"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn toggle_comments_via_lsp(
+        &mut self,
+        buffer: Entity<Buffer>,
+        selections: Vec<Range<Anchor>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Transaction>>> {
+        self.request_lsp(
+            buffer,
+            LanguageServerToQuery::FirstCapable,
+            lsp_ext_command::ToggleCommentsCommand { selections },
+            cx,
+        )
     }
 
     pub fn definitions(

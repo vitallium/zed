@@ -474,7 +474,9 @@ message Envelope {
 
     SpawnKernel spawn_kernel = 426;
     SpawnKernelResponse spawn_kernel_response = 427;
-    KillKernel kill_kernel = 428; // current max
+    KillKernel kill_kernel = 428;
+    ToggleComments toggle_comments = 431;
+    ToggleCommentsResponse toggle_comments_response = 432; // current max
   }
 
   reserved 87 to 88;

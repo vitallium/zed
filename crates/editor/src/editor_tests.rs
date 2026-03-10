@@ -17992,10 +17992,10 @@ async fn test_toggle_block_comment(cx: &mut TestAppContext) {
     });
     cx.assert_editor_state(
         &r#"
-            <!-- <p>A«</p>
-            <p>ˇ»B</p>ˇ -->
-            <!-- <p>C«</p>
-            <p>ˇ»D</p>ˇ -->
+            <!-- <p>A«</p> -->
+            <!-- <p>ˇ»B</p>ˇ -->
+            <!-- <p>C«</p> -->
+            <!-- <p>ˇ»D</p>ˇ -->
         "#
         .unindent(),
     );
@@ -18026,8 +18026,8 @@ async fn test_toggle_block_comment(cx: &mut TestAppContext) {
     cx.update_editor(|editor, window, cx| {
         editor.toggle_comments(&ToggleComments::default(), window, cx)
     });
-    // TODO this is how it actually worked in Zed Stable, which is not very ergonomic.
-    // Uncommenting and commenting from this position brings in even more wrong artifacts.
+    // Each cursor resolves its row's language scope independently:
+    // <script> and </script> use HTML block comments, var uses JS line comments.
     cx.assert_editor_state(
         &r#"
             <!-- ˇ<script> -->
@@ -18036,6 +18036,257 @@ async fn test_toggle_block_comment(cx: &mut TestAppContext) {
         "#
         .unindent(),
     );
+
+    // Toggle comments for a multi-row selection spanning HTML and JavaScript
+    // injection boundaries. Each row should get the comment style appropriate
+    // to its language scope.
+    cx.set_state(
+        &r#"
+            «<script>
+                var x = new Y();
+            </script>ˇ»
+        "#
+        .unindent(),
+    );
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state(
+        &r#"
+            <!-- «<script> -->
+                // var x = new Y();
+            <!-- </script>ˇ» -->
+        "#
+        .unindent(),
+    );
+}
+
+#[gpui::test]
+async fn test_toggle_comment_with_overrides(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    // Simulate an ERB-like setup using HTML grammar with overrides.
+    // The override changes comment config inside <script> elements to use
+    // line comments (like Ruby's `# `) instead of HTML block comments.
+    // This demonstrates how ERB could use overrides on `directive` nodes
+    // to get `# ` comments for code regions.
+    let mut overrides = HashMap::default();
+    overrides.insert(
+        "element".to_string(),
+        LanguageConfigOverride {
+            line_comments: Override::Set(vec!["// ".into()]),
+            block_comment: Override::Set(BlockCommentConfig {
+                start: "{/* ".into(),
+                prefix: "".into(),
+                end: " */}".into(),
+                tab_size: 0,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let html_language = Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: "HTML".into(),
+                block_comment: Some(BlockCommentConfig {
+                    start: "<!-- ".into(),
+                    prefix: "".into(),
+                    end: " -->".into(),
+                    tab_size: 0,
+                }),
+                overrides,
+                ..Default::default()
+            },
+            Some(tree_sitter_html::LANGUAGE.into()),
+        )
+        .with_override_query("(script_element) @element")
+        .unwrap(),
+    );
+
+    cx.language_registry().add(html_language.clone());
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language(Some(html_language), cx);
+    });
+
+    // Inside <script>, the override applies: line_comments = ["// "].
+    // Outside, the default HTML block comment applies.
+    cx.set_state(
+        &r#"
+            <p>hello</p>
+            <script>
+                ˇvar x = 1;
+            </script>
+            <p>world</p>
+        "#
+        .unindent(),
+    );
+    cx.executor().run_until_parked();
+
+    // Toggle comment on the JS line inside <script> — override applies.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state(
+        &r#"
+            <p>hello</p>
+            <script>
+                // ˇvar x = 1;
+            </script>
+            <p>world</p>
+        "#
+        .unindent(),
+    );
+
+    // Uncomment round-trips.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state(
+        &r#"
+            <p>hello</p>
+            <script>
+                ˇvar x = 1;
+            </script>
+            <p>world</p>
+        "#
+        .unindent(),
+    );
+
+    // Toggle comment on an HTML line outside <script> — default block comment.
+    cx.set_state(
+        &r#"
+            ˇ<p>hello</p>
+            <script>
+                var x = 1;
+            </script>
+            <p>world</p>
+        "#
+        .unindent(),
+    );
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state(
+        &r#"
+            <!-- ˇ<p>hello</p> -->
+            <script>
+                var x = 1;
+            </script>
+            <p>world</p>
+        "#
+        .unindent(),
+    );
+}
+
+#[gpui::test]
+async fn test_toggle_inline_comment(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    // Simulate ERB: inline_comment mutates `<%` → `<%#`,
+    // block_comment wraps with `<!-- -->` for non-ERB lines.
+    let language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "ERB".into(),
+            inline_comment: Some(language::InlineCommentConfig {
+                start: "<%".into(),
+                comment_start: "<%#".into(),
+                end: None,
+                comment_end: None,
+            }),
+            block_comment: Some(BlockCommentConfig {
+                start: "<!-- ".into(),
+                prefix: "".into(),
+                end: " -->".into(),
+                tab_size: 0,
+            }),
+            ..Default::default()
+        },
+        Some(tree_sitter_html::LANGUAGE.into()),
+    ));
+
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
+
+    // Comment an ERB tag line: `<%` becomes `<%#`
+    cx.set_state("<% if true %>\n<p>helloˇ</p>\n<% end %>\n");
+    cx.update_editor(|e, window, cx| {
+        e.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    // Cursor is on the HTML line — it gets `<!-- -->`
+    cx.assert_editor_state("<% if true %>\n<!-- <p>helloˇ</p> -->\n<% end %>\n");
+
+    // Uncomment round-trips
+    cx.update_editor(|e, window, cx| {
+        e.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state("<% if true %>\n<p>helloˇ</p>\n<% end %>\n");
+
+    // Comment an ERB tag line directly
+    cx.set_state("<% if trueˇ %>\n<p>hello</p>\n<% end %>\n");
+    cx.update_editor(|e, window, cx| {
+        e.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state("<%# if trueˇ %>\n<p>hello</p>\n<% end %>\n");
+
+    // Uncomment round-trips
+    cx.update_editor(|e, window, cx| {
+        e.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state("<% if trueˇ %>\n<p>hello</p>\n<% end %>\n");
+
+    // Multi-row selection spanning ERB and HTML lines:
+    // ERB lines get `<%#`, HTML lines get `<!-- -->`
+    cx.set_state(
+        &"«<% if true %>\n<p>hello</p>\n<% end %>\nˇ»",
+    );
+    cx.update_editor(|e, window, cx| {
+        e.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    // Verify the buffer text is correct (selection positions shift due to edits)
+    cx.assert_editor_state(
+        &"<%#« if true %>\n<!-- <p>hello</p> -->\n<%# end %>\nˇ»",
+    );
+}
+
+#[gpui::test]
+async fn test_toggle_inline_comment_with_end_delimiter(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    // Simulate JSP/ASP: `<%` → `<%--`, `%>` → `--%>`
+    let language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "JSP".into(),
+            inline_comment: Some(language::InlineCommentConfig {
+                start: "<%".into(),
+                comment_start: "<%--".into(),
+                end: Some("%>".into()),
+                comment_end: Some("--%>".into()),
+            }),
+            ..Default::default()
+        },
+        Some(tree_sitter_html::LANGUAGE.into()),
+    ));
+
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
+
+    cx.set_state("<% if trueˇ %>\n");
+    cx.update_editor(|e, window, cx| {
+        e.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state("<%-- if trueˇ --%>\n");
+
+    // Uncomment round-trips
+    cx.update_editor(|e, window, cx| {
+        e.toggle_comments(&ToggleComments::default(), window, cx)
+    });
+    cx.assert_editor_state("<% if trueˇ %>\n");
 }
 
 #[gpui::test]
