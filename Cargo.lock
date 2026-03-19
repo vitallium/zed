@@ -18473,6 +18473,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "theme_checker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "globset",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_json_lenient",
+ "theme",
+ "walkdir",
+]
+
+[[package]]
 name = "theme_extension"
 version = "0.1.0"
 dependencies = [
