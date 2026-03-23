@@ -23,6 +23,8 @@ pub struct Command {
     pub args: Vec<String>,
     /// The environment variables to set for the command.
     pub env: EnvVars,
+    /// The working directory for the command
+    pub working_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Command {
@@ -37,6 +39,7 @@ impl std::fmt::Debug for Command {
             .field("command", &self.command)
             .field("args", &self.args)
             .field("env", &filtered_env)
+            .field("working_dir", &self.working_dir)
             .finish()
     }
 }

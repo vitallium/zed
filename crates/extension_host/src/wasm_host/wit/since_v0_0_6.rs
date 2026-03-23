@@ -48,6 +48,7 @@ impl From<Command> for latest::Command {
             command: value.command,
             args: value.args,
             env: value.env,
+            working_dir: value.working_dir,
         }
     }
 }

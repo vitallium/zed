@@ -9,6 +9,7 @@ impl Command {
             command: program.into(),
             args: Vec::new(),
             env: Vec::new(),
+            working_dir: None,
         }
     }
 
@@ -35,6 +36,11 @@ impl Command {
             envs.into_iter()
                 .map(|(key, value)| (key.into(), value.into())),
         );
+        self
+    }
+
+    pub fn working_dir(mut self, dir: impl Into<String>) -> Self {
+        self.working_dir = Some(dir.into());
         self
     }
 

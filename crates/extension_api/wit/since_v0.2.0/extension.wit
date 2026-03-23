@@ -67,6 +67,8 @@ world extension {
         args: list<string>,
         /// The environment variables to set for the command.
         env: env-vars,
+        /// The working directory of the command.
+        working-dir: option<string>,
     }
 
     /// A Zed worktree.

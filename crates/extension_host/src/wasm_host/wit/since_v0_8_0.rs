@@ -90,6 +90,7 @@ impl From<Command> for extension::Command {
             command: value.command.into(),
             args: value.args,
             env: value.env,
+            working_dir: value.working_dir.map(PathBuf::from),
         }
     }
 }
@@ -872,6 +873,10 @@ impl process::Host for WasmState {
         &mut self,
         command: process::Command,
     ) -> wasmtime::Result<Result<process::Output, String>> {
+        let working_dir = command
+            .working_dir
+            .unwrap_or_else(|| self.work_dir().to_string_lossy().to_string());
+
         maybe!(async {
             self.capability_granter
                 .grant_exec(&command.command, &command.args)?;
@@ -879,6 +884,7 @@ impl process::Host for WasmState {
             let output = util::command::new_command(command.command.as_str())
                 .args(&command.args)
                 .envs(command.env)
+                .current_dir(&working_dir)
                 .output()
                 .await?;
 

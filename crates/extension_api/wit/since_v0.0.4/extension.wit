@@ -54,6 +54,7 @@ world extension {
         command: string,
         args: list<string>,
         env: env-vars,
+        working-dir: option<string>,
     }
 
     resource worktree {
