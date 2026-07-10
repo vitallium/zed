@@ -38315,6 +38315,32 @@ fn test_review_comment_take_all(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comment_payloads_are_non_destructive_and_clear_on_success(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    _ = editor.update(cx, |editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let key = test_hunk_key_with_anchor("src/lib.rs", snapshot.anchor_before(Point::new(0, 0)));
+        add_test_comment(editor, key, "Preserve the fallback", cx);
+
+        let payloads = editor.review_comment_payloads(cx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(editor.total_review_comment_count(), 1);
+        assert_eq!(payloads[0].comment, "Preserve the fallback");
+        assert!(matches!(
+            &payloads[0].target,
+            ReviewCommentTarget::Hunk { file_path, stale: false, .. }
+                if file_path.as_ref().as_unix_str() == "src/lib.rs"
+        ));
+
+        editor.clear_review_comments(cx);
+        assert!(editor.review_comment_payloads(cx).is_empty());
+        assert_eq!(editor.total_review_comment_count(), 0);
+    });
+}
+
+#[gpui::test]
 fn test_diff_review_overlay_show_and_dismiss(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -38329,7 +38355,7 @@ fn test_diff_review_overlay_show_and_dismiss(cx: &mut TestAppContext) {
 
     // Verify overlay is shown
     editor
-        .update(cx, |editor, _window, cx| {
+        .update(cx, |editor, _window, _cx| {
             assert!(!editor.diff_review_overlays.is_empty());
             assert_eq!(editor.diff_review_line_range(cx), Some((0, 0)));
             assert!(editor.diff_review_prompt_editor().is_some());
@@ -38368,7 +38394,7 @@ fn test_diff_review_overlay_dismiss_via_cancel(cx: &mut TestAppContext) {
 
     // Verify overlay is shown
     editor
-        .update(cx, |editor, _window, _cx| {
+        .update(cx, |editor, _window, cx| {
             assert!(!editor.diff_review_overlays.is_empty());
         })
         .unwrap();
@@ -38525,8 +38551,17 @@ fn test_orphaned_comments_are_cleaned_up(cx: &mut TestAppContext) {
     editor
         .update(cx, |editor, _window, cx| {
             editor.cleanup_orphaned_review_comments(cx);
-            // Comment should be removed because its anchor is invalid
-            assert_eq!(editor.total_review_comment_count(), 0);
+            // The comment remains available and is marked stale when exported.
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert!(
+                editor
+                    .review_comment_payloads(cx)
+                    .iter()
+                    .any(|payload| matches!(
+                        payload.target,
+                        ReviewCommentTarget::Hunk { stale: true, .. }
+                    ))
+            );
         })
         .unwrap();
 }
@@ -38568,10 +38603,18 @@ fn test_orphaned_comments_cleanup_called_on_buffer_edit(cx: &mut TestAppContext)
 
     // Verify cleanup happened automatically (not manually triggered)
     editor
-        .update(cx, |editor, _window, _cx| {
-            // Comment should be removed because its anchor became invalid
-            // and cleanup was called automatically on buffer edit
-            assert_eq!(editor.total_review_comment_count(), 0);
+        .update(cx, |editor, _window, cx| {
+            // The comment remains available and is marked stale after automatic cleanup.
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert!(
+                editor
+                    .review_comment_payloads(cx)
+                    .iter()
+                    .any(|payload| matches!(
+                        payload.target,
+                        ReviewCommentTarget::Hunk { stale: true, .. }
+                    ))
+            );
         })
         .unwrap();
 }

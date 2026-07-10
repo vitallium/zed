@@ -1,5 +1,5 @@
-use crate::{Keep, KeepAll, OpenAgentDiff, Reject, RejectAll};
-use acp_thread::{AcpThread, AcpThreadEvent};
+use crate::{AgentPanel, Keep, KeepAll, OpenAgentDiff, Reject, RejectAll};
+use acp_thread::{AcpThread, AcpThreadEvent, ThreadStatus};
 use action_log::{ActionLogTelemetry, LastRejectUndo};
 use agent_settings::AgentSettings;
 use anyhow::Result;
@@ -7,8 +7,9 @@ use buffer_diff::DiffHunkStatus;
 use collections::{HashMap, HashSet};
 use editor::{
     DiffHunkDelegate, Direction, Editor, EditorEvent, EditorSettings, MultiBuffer,
-    MultiBufferSnapshot, ResolvedDiffHunks, SelectionEffects, SplittableEditor, ToPoint,
-    actions::{GoToHunk, GoToPreviousHunk},
+    MultiBufferSnapshot, ResolvedDiffHunks, ReviewCommentPayload, SelectionEffects,
+    SplittableEditor, ToPoint,
+    actions::{GoToHunk, GoToPreviousHunk, Newline, SendReviewToAgent},
     multibuffer_context_lines,
     scroll::Autoscroll,
 };
@@ -41,13 +42,149 @@ use zed_actions::assistant::ToggleFocus;
 pub struct AgentDiffPane {
     multibuffer: Entity<MultiBuffer>,
     editor: Entity<SplittableEditor>,
+    global_comment_editor: Entity<Editor>,
     thread: Entity<AcpThread>,
+    review_comment_count: usize,
+    global_review_comments: Vec<String>,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AgentDiffPane {
+    pub fn add_diff_review_comment(&mut self, comment: String, cx: &mut Context<Self>) -> bool {
+        let comment = comment.trim();
+        if comment.is_empty() {
+            return false;
+        }
+        self.global_review_comments.push(comment.to_string());
+        self.review_comment_count += 1;
+        cx.notify();
+        true
+    }
+
+    pub fn review_comment_payloads(&self, cx: &App) -> Vec<ReviewCommentPayload> {
+        let mut payloads = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comment_payloads(cx);
+        let next_id = payloads.iter().map(|payload| payload.id).max().unwrap_or(0) + 1;
+        payloads.extend(
+            self.global_review_comments
+                .iter()
+                .enumerate()
+                .map(|(index, comment)| ReviewCommentPayload {
+                    id: next_id + index,
+                    comment: comment.clone(),
+                    target: editor::ReviewCommentTarget::Diff,
+                }),
+        );
+        payloads
+    }
+
+    pub fn clear_review_comments(&mut self, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.clear_review_comments(cx);
+            });
+        });
+        self.global_review_comments.clear();
+        self.review_comment_count = 0;
+        cx.notify();
+    }
+
+    fn send_review_to_agent(
+        &mut self,
+        _: &SendReviewToAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return;
+        };
+        if self.thread.read(cx).status() != ThreadStatus::Idle {
+            return;
+        }
+        let session_id = self.thread.read(cx).session_id().clone();
+        let thread_view = panel
+            .read(cx)
+            .conversation_views()
+            .into_iter()
+            .find_map(|conversation| conversation.read(cx).thread_view(&session_id));
+        let Some(thread_view) = thread_view else {
+            return;
+        };
+        let comments = self.review_comment_payloads(cx);
+        if comments.is_empty() {
+            return;
+        }
+        let rhs_editor = self.editor.read(cx).rhs_editor().clone();
+        let snapshot = rhs_editor.read(cx).buffer().read(cx).snapshot(cx);
+        let mut message = String::from("Please address this review feedback:\n\n");
+        for comment in comments {
+            match comment.target {
+                editor::ReviewCommentTarget::Hunk {
+                    file_path,
+                    hunk_start,
+                    range,
+                    stale,
+                } => {
+                    if stale {
+                        message.push_str(&format!(
+                            "- `{}` (stale hunk; original line unavailable): {}\n",
+                            file_path.as_unix_str(),
+                            comment.comment
+                        ));
+                    } else {
+                        let start = hunk_start.to_point(&snapshot);
+                        let range_start = range.start.to_point(&snapshot);
+                        let range_end = range.end.to_point(&snapshot);
+                        message.push_str(&format!(
+                            "- `{}` (hunk {}, lines {}-{}, active): {}\n",
+                            file_path.as_unix_str(),
+                            start.row + 1,
+                            range_start.row + 1,
+                            range_end.row + 1,
+                            comment.comment
+                        ));
+                    }
+                }
+                editor::ReviewCommentTarget::Diff => {
+                    message.push_str(&format!("- Diff: {}\n", comment.comment));
+                }
+            }
+        }
+        let pane = cx.entity().downgrade();
+        thread_view
+            .update(cx, |thread_view, cx| {
+                thread_view.send_review_message(
+                    message,
+                    Box::new(move |success, cx| {
+                        if success {
+                            pane.update(cx, |pane, cx| pane.clear_review_comments(cx))
+                                .log_err();
+                        }
+                    }),
+                    window,
+                    cx,
+                )
+            })
+            .ok();
+    }
+
+    fn submit_global_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let comment = self.global_comment_editor.read(cx).text(cx);
+        if self.add_diff_review_comment(comment, cx) {
+            self.global_comment_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+        }
+    }
+
     pub fn deploy(
         thread: Entity<AcpThread>,
         workspace: WeakEntity<Workspace>,
@@ -102,13 +239,30 @@ impl AgentDiffPane {
             );
             diff_display_editor
                 .set_diff_hunk_delegate(Some(agent_diff_delegate(&thread, workspace.clone())), cx);
+            diff_display_editor.rhs_editor().update(cx, |editor, cx| {
+                editor.set_show_diff_review_button(true, cx);
+            });
             diff_display_editor.update_editors(cx, |editor, _cx| {
                 editor.register_addon(AgentDiffAddon);
             });
             diff_display_editor
         });
+        let global_comment_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Add a comment about the entire diff…", window, cx);
+            editor
+        });
+        let parent = cx.entity().downgrade();
+        let global_comment_subscription = global_comment_editor.update(cx, |editor, _cx| {
+            editor.register_action(move |_: &Newline, window, cx| {
+                if let Some(parent) = parent.upgrade() {
+                    parent.update(cx, |pane, cx| pane.submit_global_comment(window, cx));
+                }
+            })
+        });
 
         let action_log = thread.read(cx).action_log().clone();
+        let rhs_editor = editor.read(cx).rhs_editor().clone();
 
         let mut this = Self {
             _subscriptions: vec![
@@ -118,10 +272,21 @@ impl AgentDiffPane {
                 cx.subscribe(&thread, |this, _thread, event, cx| {
                     this.handle_acp_thread_event(event, cx)
                 }),
+                cx.subscribe(&rhs_editor, |this, _editor, event: &EditorEvent, cx| {
+                    if let EditorEvent::ReviewCommentsChanged { total_count } = event {
+                        this.review_comment_count =
+                            *total_count + this.global_review_comments.len();
+                        cx.notify();
+                    }
+                }),
+                global_comment_subscription,
             ],
             multibuffer,
             editor,
+            global_comment_editor,
             thread,
+            review_comment_count: 0,
+            global_review_comments: Vec::new(),
             focus_handle,
             workspace,
         };
@@ -696,6 +861,7 @@ impl Render for AgentDiffPane {
             .on_action(cx.listener(Self::reject))
             .on_action(cx.listener(Self::reject_all))
             .on_action(cx.listener(Self::keep_all))
+            .on_action(cx.listener(Self::send_review_to_agent))
             // Only paint the background for the empty state. When the diff editor
             // is shown it already paints `editor_background`; painting it again
             // here double-composites into a darker patch on transparent windows.
@@ -730,7 +896,22 @@ impl Render for AgentDiffPane {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |el| {
+                el.child(
+                    v_flex().size_full().child(self.editor.clone()).child(
+                        v_flex()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border)
+                            .p_1()
+                            .children(
+                                self.global_review_comments
+                                    .iter()
+                                    .map(|comment| div().text_sm().child(comment.clone())),
+                            )
+                            .child(self.global_comment_editor.clone()),
+                    ),
+                )
+            })
     }
 }
 
@@ -1241,6 +1422,29 @@ impl Render for AgentDiffToolbar {
                 }
 
                 let focus_handle = agent_diff.focus_handle(cx);
+                let review_comment_count = agent_diff.read(cx).review_comment_count;
+                let thread_is_busy =
+                    agent_diff.read(cx).thread.read(cx).status() != ThreadStatus::Idle;
+                let review_button = (review_comment_count > 0).then(|| {
+                    Button::new(
+                        "send-review",
+                        format!("Send Review to Agent ({review_comment_count})"),
+                    )
+                    .start_icon(
+                        Icon::new(IconName::ZedAssistant)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::for_action_title_in(
+                        "Send all review comments to the originating agent thread",
+                        &SendReviewToAgent,
+                        &focus_handle,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&SendReviewToAgent, window, cx)
+                    }))
+                    .disabled(thread_is_busy)
+                });
 
                 h_group_xl()
                     .my_neg_1()
@@ -1270,6 +1474,9 @@ impl Render for AgentDiffToolbar {
                                     })),
                             ),
                     )
+                    .when_some(review_button, |this, button| {
+                        this.child(Divider::vertical()).child(button)
+                    })
                     .into_any()
             }
         }

@@ -635,6 +635,7 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    review_send_result: Option<Box<dyn FnOnce(bool, &mut App) + 'static>>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -1032,6 +1033,7 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            review_send_result: None,
         };
 
         this.sync_generating_indicator(cx);
@@ -1534,6 +1536,26 @@ impl ThreadView {
         self.send_impl(message_editor, window, cx)
     }
 
+    /// Sends review feedback through the normal user-message path.
+    pub fn send_review_message(
+        &mut self,
+        text: String,
+        on_result: Box<dyn FnOnce(bool, &mut App) + 'static>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if text.trim().is_empty() {
+            return false;
+        }
+        self.message_editor.update(cx, |editor, cx| {
+            editor.clear(window, cx);
+            editor.insert_text(&text, window, cx);
+        });
+        self.review_send_result = Some(on_result);
+        self.send(window, cx);
+        true
+    }
+
     /// Sends a bare `/command` turn and queues everything the user typed after
     /// it as a follow-up message. The queued remainder auto-processes when the
     /// command turn stops, so e.g. `/compact do X` compacts and then runs `do X`
@@ -1771,13 +1793,14 @@ impl ThreadView {
         });
 
         cx.spawn(async move |this, cx| {
-            if let Err(err) = task.await {
-                this.update(cx, |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Some(on_result) = this.review_send_result.take() {
+                    on_result(result.is_ok(), cx);
+                }
+                if let Err(err) = result {
                     this.handle_thread_error(err, cx);
-                })
-                .ok();
-            } else {
-                this.update(cx, |this, cx| {
+                } else {
                     let should_be_following = this
                         .workspace
                         .update(cx, |workspace, _| {
@@ -1785,9 +1808,9 @@ impl ThreadView {
                         })
                         .unwrap_or_default();
                     this.should_be_following = should_be_following;
-                })
-                .ok();
-            }
+                }
+            })
+            .ok();
         })
         .detach();
     }

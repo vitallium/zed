@@ -273,7 +273,12 @@ impl NodeRuntime {
             )
             .await?;
 
-        let info: NpmInfo = serde_json::from_slice(&output.stdout)?;
+        let info: NpmInfo = deserialize_npm_info_from_response(&output.stdout).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse npm info response: {e}\nstdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })?;
         let before = npm_config_before(instance.as_ref(), http.proxy())
             .await
             .context("getting npm before config")
@@ -410,6 +415,22 @@ pub struct NpmInfo {
     versions: Vec<Version>,
     #[serde(default, deserialize_with = "deserialize_npm_info_time")]
     time: HashMap<String, String>,
+}
+
+/// Parse NpmInfo from npm info --json output, handling both old and new formats.
+/// npm ≤10 returns a bare JSON object, npm ≥11 returns an array with one object.
+fn deserialize_npm_info_from_response(data: &[u8]) -> Result<NpmInfo, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(data)?;
+
+    // Handle array format (npm ≥11): [ { "dist-tags": {...}, "versions": [...], "time": {...} } ]
+    if let serde_json::Value::Array(arr) = &value {
+        if arr.len() == 1 {
+            return NpmInfo::deserialize(&arr[0]);
+        }
+    }
+
+    // Handle object format (npm ≤10): { "dist-tags": {...}, "versions": [...], "time": {...} }
+    NpmInfo::deserialize(value)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1104,8 +1125,8 @@ mod tests {
     use semver::Version;
 
     use super::{
-        NpmInfo, VersionStrategy, build_npm_command_args, proxy_argument,
-        select_npm_package_version, should_install_npm_package_version,
+        NpmInfo, VersionStrategy, build_npm_command_args, deserialize_npm_info_from_response,
+        proxy_argument, select_npm_package_version, should_install_npm_package_version,
     };
 
     // Map localhost to 127.0.0.1
@@ -1381,6 +1402,97 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "no version found for npm package test-package before 2023-12-01T00:00:00.000Z"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_npm_info_old_format() -> Result<()> {
+        // Test old npm format (≤10): bare JSON object
+        let json = r#"{
+            "dist-tags": { "latest": "3.0.0" },
+            "versions": ["1.0.0", "2.0.0", "3.0.0"],
+            "time": {
+                "1.0.0": "2024-01-01T00:00:00.000Z",
+                "2.0.0": "2024-02-01T00:00:00.000Z",
+                "3.0.0": "2024-03-01T00:00:00.000Z"
+            }
+        }"#;
+
+        let info = deserialize_npm_info_from_response(json.as_bytes())?;
+        assert_eq!(info.dist_tags.latest, Some(Version::parse("3.0.0")?));
+        assert_eq!(
+            info.versions,
+            vec![
+                Version::parse("1.0.0")?,
+                Version::parse("2.0.0")?,
+                Version::parse("3.0.0")?
+            ]
+        );
+        assert_eq!(info.time.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_npm_info_new_format() -> Result<()> {
+        // Test new npm format (≥11): array-wrapped JSON object
+        let json = r#"[
+            {
+                "dist-tags": { "latest": "3.0.0" },
+                "versions": ["1.0.0", "2.0.0", "3.0.0"],
+                "time": {
+                    "1.0.0": "2024-01-01T00:00:00.000Z",
+                    "2.0.0": "2024-02-01T00:00:00.000Z",
+                    "3.0.0": "2024-03-01T00:00:00.000Z"
+                }
+            }
+        ]"#;
+
+        let info = deserialize_npm_info_from_response(json.as_bytes())?;
+        assert_eq!(info.dist_tags.latest, Some(Version::parse("3.0.0")?));
+        assert_eq!(
+            info.versions,
+            vec![
+                Version::parse("1.0.0")?,
+                Version::parse("2.0.0")?,
+                Version::parse("3.0.0")?
+            ]
+        );
+        assert_eq!(info.time.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_npm_info_new_format_with_kebab_case() -> Result<()> {
+        // Test new npm format with kebab-case field names (as npm actually outputs)
+        let json = r#"[
+            {
+                "dist-tags": { "latest": "3.0.0" },
+                "versions": ["1.0.0", "2.0.0", "3.0.0"],
+                "time": {
+                    "1.0.0": "2024-01-01T00:00:00.000Z",
+                    "2.0.0": "2024-02-01T00:00:00.000Z",
+                    "3.0.0": "2024-03-01T00:00:00.000Z"
+                }
+            }
+        ]"#;
+
+        let info = deserialize_npm_info_from_response(json.as_bytes())?;
+        assert_eq!(info.dist_tags.latest, Some(Version::parse("3.0.0")?));
+        assert_eq!(
+            info.versions,
+            vec![
+                Version::parse("1.0.0")?,
+                Version::parse("2.0.0")?,
+                Version::parse("3.0.0")?
+            ]
+        );
+        assert_eq!(info.time.len(), 3);
+
+        // Test that select_npm_package_version works with the new format
+        assert_eq!(
+            select_npm_package_version("test-package", info, None)?,
+            Version::parse("3.0.0")?
         );
         Ok(())
     }
