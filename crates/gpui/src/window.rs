@@ -1409,8 +1409,27 @@ impl Window {
 
         let tab_bar_visible = platform_window.tab_bar_visible();
         SystemWindowTabController::init_visible(cx, tab_bar_visible);
-        if let Some(tabs) = platform_window.tabbed_windows() {
+        if platform_window.system_window_tab_participant()
+            && let Some(tabs) = platform_window.tabbed_windows()
+        {
             SystemWindowTabController::sync_tab_group(cx, handle.window_id(), tabs);
+        }
+
+        if platform_window.system_window_tab_participant() {
+            platform_window.on_system_window_tab_group_change({
+                let cx = cx.to_async();
+                Box::new(move || {
+                    let foreground_executor = cx.foreground_executor().clone();
+                    let cx = cx.clone();
+                    foreground_executor
+                        .spawn(async move {
+                            cx.update(|cx| {
+                                SystemWindowTabController::sync_all_window_tab_groups(cx);
+                            });
+                        })
+                        .detach();
+                })
+            });
         }
 
         let display_id = platform_window.display().map(|display| display.id());
@@ -6052,6 +6071,11 @@ impl Window {
         self.platform_window.move_tab_to_new_window()
     }
 
+    /// Moves this window's native tab to the given visual index.
+    pub fn move_tab_to_index(&self, index: usize) {
+        self.platform_window.move_tab_to_index(index)
+    }
+
     /// Shows or hides the window tab overview.
     /// This is macOS specific.
     pub fn toggle_window_tab_overview(&self) {
@@ -6063,6 +6087,11 @@ impl Window {
     pub fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
         self.platform_window
             .set_tabbing_identifier(tabbing_identifier)
+    }
+
+    /// Removes this window from its native tab group.
+    pub fn remove_from_tab_group(&self) {
+        self.platform_window.remove_from_tab_group()
     }
 
     /// Returns whether this window may participate in Zed-managed native window tabs.
