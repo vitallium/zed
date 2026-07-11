@@ -109,7 +109,7 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum UserTabbingPreference {
     Never,
     Always,
