@@ -866,10 +866,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
     fn on_select_next_tab(&self, _callback: Box<dyn FnMut()>) {}
     fn on_toggle_tab_bar(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_system_window_tab_group_change(&self, _callback: Box<dyn FnMut()>) {}
     fn merge_all_windows(&self) {}
     fn move_tab_to_new_window(&self) {}
     fn toggle_window_tab_overview(&self) {}
     fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
+    fn remove_from_tab_group(&self) {}
+    fn move_tab_to_index(&self, _index: usize) {}
     fn system_window_tab_participant(&self) -> bool {
         false
     }
