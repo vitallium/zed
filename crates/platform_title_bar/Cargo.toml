@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 gpui.workspace = true
 project.workspace = true
+util.workspace = true
 settings.workspace = true
 smallvec.workspace = true
 theme.workspace = true
