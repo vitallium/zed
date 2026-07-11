@@ -22,7 +22,8 @@ use crate::{
 };
 
 pub use system_window_tabs::{
-    DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, ShowNextWindowTab, ShowPreviousWindowTab,
+    DraggedWindowTab, MergeAllWindows, MoveTabToNextWindow, ShowNextWindowTab,
+    ShowPreviousWindowTab,
 };
 
 /// With client-side decorations, the title bar is pulled over the window frame's
