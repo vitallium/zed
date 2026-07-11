@@ -75,25 +75,30 @@ impl SystemWindowTabs {
             SystemWindowTabController::init(cx);
 
             cx.windows().iter().for_each(|handle| {
-                handle.update(cx, |_, window, cx| {
-                    if window.system_window_tab_participant() {
-                        window.set_tabbing_identifier(tabbing_identifier.clone());
-                    } else {
-                        window.set_tabbing_identifier(None);
-                    }
-                    if use_system_window_tabs && window.system_window_tab_participant() {
-                        let tabs = if let Some(tabs) = window.tabbed_windows() {
-                            tabs
+                handle
+                    .update(cx, |_, window, cx| {
+                        if window.system_window_tab_participant() {
+                            if !use_system_window_tabs {
+                                window.remove_from_tab_group();
+                            }
+                            window.set_tabbing_identifier(tabbing_identifier.clone());
                         } else {
-                            vec![SystemWindowTab::new(
-                                SharedString::from(window.window_title()),
-                                window.window_handle(),
-                            )]
-                        };
+                            window.set_tabbing_identifier(None);
+                        }
+                        if use_system_window_tabs && window.system_window_tab_participant() {
+                            let tabs = if let Some(tabs) = window.tabbed_windows() {
+                                tabs
+                            } else {
+                                vec![SystemWindowTab::new(
+                                    SharedString::from(window.window_title()),
+                                    window.window_handle(),
+                                )]
+                            };
 
-                        SystemWindowTabController::sync_tab_group(cx, handle.window_id(), tabs);
-                    }
-                }).log_err();
+                            SystemWindowTabController::sync_tab_group(cx, handle.window_id(), tabs);
+                        }
+                    })
+                    .log_err();
             });
         })
         .detach();
@@ -165,9 +170,11 @@ impl SystemWindowTabs {
         if id == window.window_handle().window_id() {
             Self::move_current_tab_to_next_window(window, cx);
         } else {
-            handle.update(cx, |_, window, cx| {
-                Self::move_current_tab_to_next_window(window, cx);
-            }).log_err();
+            handle
+                .update(cx, |_, window, cx| {
+                    Self::move_current_tab_to_next_window(window, cx);
+                })
+                .log_err();
         }
     }
 
@@ -384,6 +391,10 @@ impl SystemWindowTabs {
     }
 
     fn handle_tab_drop(dragged_tab: &DraggedWindowTab, ix: usize, cx: &mut Context<Self>) {
+        dragged_tab
+            .handle
+            .update(cx, |_, window, _| window.move_tab_to_index(ix))
+            .log_err();
         SystemWindowTabController::update_tab_position(cx, dragged_tab.id, ix);
     }
 
