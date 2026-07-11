@@ -31,7 +31,8 @@ use futures::{FutureExt, StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
+    AnyWindowHandle, App, AppContext, Application, AsyncApp, QuitMode, SystemWindowTabController,
+    Task, TaskExt, UpdateGlobal as _, WindowId, block_on,
 };
 use gpui_platform;
 
@@ -1426,12 +1427,14 @@ pub(crate) async fn restore_or_create_workspace(
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
     if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
         let mut error_count = 0;
+        let mut restored_windows = Vec::new();
         for multi_workspace in multi_workspaces {
+            let previous_window_id = multi_workspace.active_workspace.window_id;
             let result = match &multi_workspace.active_workspace.location {
                 SerializedWorkspaceLocation::Local => {
                     restore_multiworkspace(multi_workspace, app_state.clone(), cx)
                         .await
-                        .map(|_| ())
+                        .map(AnyWindowHandle::from)
                 }
                 SerializedWorkspaceLocation::Remote(connection_options) => {
                     let mut connection_options = connection_options.clone();
@@ -1466,17 +1469,24 @@ pub(crate) async fn restore_or_create_workspace(
                             cx,
                         )
                         .await;
-                        Ok::<(), anyhow::Error>(())
+                        Ok::<AnyWindowHandle, anyhow::Error>(window.into())
                     }
                     .await
                 }
             };
 
-            if let Err(error) = result {
-                log::error!("Failed to restore workspace: {error:#}");
-                error_count += 1;
+            match result {
+                Ok(window) => restored_windows.push((previous_window_id, window)),
+                Err(error) => {
+                    log::error!("Failed to restore workspace: {error:#}");
+                    error_count += 1;
+                }
             }
         }
+
+        let window_tab_groups =
+            cx.update(|cx| app_state.session.read(cx).last_session_window_tab_groups());
+        restore_system_window_tabs(window_tab_groups, &restored_windows, cx);
 
         if error_count > 0 {
             let message = if error_count == 1 {
@@ -1584,6 +1594,70 @@ async fn restorable_workspaces(
 ) -> Option<Vec<workspace::SerializedMultiWorkspace>> {
     let locations = restorable_workspace_locations(cx, app_state).await?;
     Some(cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx)))
+}
+
+fn restore_system_window_tabs(
+    window_tab_groups: Option<Vec<Vec<WindowId>>>,
+    restored_windows: &[(Option<WindowId>, AnyWindowHandle)],
+    cx: &mut AsyncApp,
+) {
+    let Some(window_tab_groups) = window_tab_groups else {
+        return;
+    };
+
+    cx.update(|cx| {
+        let Some(restored_tab_group_memberships) = restored_tab_group_memberships(
+            WorkspaceSettings::get_global(cx).use_system_window_tabs,
+            Some(&window_tab_groups),
+            restored_windows,
+        ) else {
+            return;
+        };
+
+        for (_, window) in restored_windows {
+            window
+                .update(cx, |_, window, _| window.remove_from_tab_group())
+                .log_err();
+        }
+
+        for (target, window) in restored_tab_group_memberships {
+            cx.add_window_tab(target, window);
+        }
+
+        SystemWindowTabController::sync_all_window_tab_groups(cx);
+    });
+}
+
+fn restored_tab_group_memberships<T: Copy>(
+    use_system_window_tabs: bool,
+    window_tab_groups: Option<&[Vec<WindowId>]>,
+    restored_windows: &[(Option<WindowId>, T)],
+) -> Option<Vec<(T, T)>> {
+    if !use_system_window_tabs {
+        return None;
+    }
+
+    let window_tab_groups = window_tab_groups?;
+    let restored_by_previous_id = restored_windows
+        .iter()
+        .filter_map(|(previous_window_id, window)| {
+            Some((previous_window_id.as_ref().copied()?, *window))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut memberships = Vec::new();
+    for tab_group in window_tab_groups {
+        let mut restored_group = tab_group
+            .iter()
+            .filter_map(|window_id| restored_by_previous_id.get(window_id).copied());
+        let Some(target) = restored_group.next() else {
+            continue;
+        };
+
+        memberships.extend(restored_group.map(|window| (target, window)));
+    }
+
+    Some(memberships)
 }
 
 pub(crate) async fn restorable_workspace_locations(
@@ -2044,6 +2118,76 @@ fn dump_all_gpui_actions() {
         serde_json::to_string_pretty(&output).unwrap().as_bytes(),
     )
     .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restored_tab_group_memberships;
+    use gpui::WindowId;
+
+    #[test]
+    fn restores_multiple_tab_groups_by_previous_window_id() {
+        let window_tab_groups = vec![
+            vec![WindowId::from(1), WindowId::from(2), WindowId::from(3)],
+            vec![WindowId::from(4), WindowId::from(5)],
+        ];
+        let restored_windows = vec![
+            (Some(WindowId::from(4)), 40),
+            (Some(WindowId::from(1)), 10),
+            (Some(WindowId::from(3)), 30),
+            (Some(WindowId::from(2)), 20),
+            (Some(WindowId::from(5)), 50),
+        ];
+
+        assert_eq!(
+            restored_tab_group_memberships(true, Some(&window_tab_groups), &restored_windows),
+            Some(vec![(10, 20), (10, 30), (40, 50)])
+        );
+    }
+
+    #[test]
+    fn restores_partial_tab_groups_and_skips_groups_without_windows() {
+        let window_tab_groups = vec![
+            vec![WindowId::from(1), WindowId::from(2), WindowId::from(3)],
+            vec![WindowId::from(4), WindowId::from(5)],
+            vec![WindowId::from(6), WindowId::from(7)],
+        ];
+        let restored_windows = vec![
+            (Some(WindowId::from(1)), 10),
+            (Some(WindowId::from(3)), 30),
+            (Some(WindowId::from(7)), 70),
+        ];
+
+        assert_eq!(
+            restored_tab_group_memberships(true, Some(&window_tab_groups), &restored_windows),
+            Some(vec![(10, 30)])
+        );
+    }
+
+    #[test]
+    fn empty_or_missing_persisted_groups_create_no_memberships() {
+        let restored_windows = vec![(Some(WindowId::from(1)), 10)];
+
+        assert_eq!(
+            restored_tab_group_memberships(true, None, &restored_windows),
+            None
+        );
+        assert_eq!(
+            restored_tab_group_memberships(true, Some(&[]), &restored_windows),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn disabled_system_window_tabs_skip_restore() {
+        let window_tab_groups = vec![vec![WindowId::from(1), WindowId::from(2)]];
+        let restored_windows = vec![(Some(WindowId::from(1)), 10), (Some(WindowId::from(2)), 20)];
+
+        assert_eq!(
+            restored_tab_group_memberships(false, Some(&window_tab_groups), &restored_windows),
+            None
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]
