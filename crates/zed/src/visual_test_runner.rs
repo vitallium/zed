@@ -1565,12 +1565,7 @@ import { AiPaneTabContext } from 'context';
         cx.run_until_parked();
     }
 
-    // Test 1: Diff view with feature flag enabled
-    // Enable the feature flag
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["diff-review".to_string()]);
-    });
-
+    // Test 1: Diff view with review controls always available
     let workspace_window: WindowHandle<Workspace> = cx
         .update(|cx| {
             cx.open_window(
@@ -1611,7 +1606,7 @@ import { AiPaneTabContext } from 'context';
 
     cx.run_until_parked();
 
-    // Capture Test 1: Diff with flag enabled
+    // Capture Test 1: Diff review button
     let test1_result = run_visual_test(
         "diff_review_button_enabled",
         workspace_window.into(),
@@ -1619,12 +1614,7 @@ import { AiPaneTabContext } from 'context';
         update_baseline,
     )?;
 
-    // Test 2: Diff view with feature flag disabled
-    // Disable the feature flag
-    cx.update(|cx| {
-        cx.update_flags(false, vec![]);
-    });
-
+    // Test 2: Review controls remain available after refresh
     // Refresh window
     cx.update_window(workspace_window.into(), |_, window, _cx| {
         window.refresh();
@@ -1635,20 +1625,15 @@ import { AiPaneTabContext } from 'context';
         cx.run_until_parked();
     }
 
-    // Capture Test 2: Diff with flag disabled
+    // Capture Test 2: Diff review button after refresh
     let test2_result = run_visual_test(
-        "diff_review_button_disabled",
+        "diff_review_button_always_enabled",
         workspace_window.into(),
         cx,
         update_baseline,
     )?;
 
-    // Test 3: Regular editor with flag enabled (should NOT show button)
-    // Re-enable the feature flag
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["diff-review".to_string()]);
-    });
-
+    // Test 3: Regular editor (should NOT show the diff gutter button)
     // Create a new window with just a regular editor
     let regular_window: WindowHandle<Workspace> = cx
         .update(|cx| {

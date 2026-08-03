@@ -2,7 +2,6 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use collections::HashMap;
-use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
     AnyElement, App, AvailableSpace, ClickEvent, Context, DefiniteLength, DispatchPhase, Element,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
@@ -15,7 +14,7 @@ use settings::Settings;
 use sum_tree::Bias;
 use text::SelectionGoal;
 use theme_settings::BufferLineHeight;
-use util::{RangeExt, debug_panic, post_inc};
+use util::{RangeExt, post_inc};
 
 use super::{EditorElement, EditorLayout, LineNumberLayout, PositionMap, SplitSide};
 use crate::{
@@ -114,7 +113,6 @@ impl EditorElement {
 
         // Handle diff review indicator when gutter is hovered in diff mode with AI enabled
         let show_diff_review = editor.show_diff_review_button()
-            && cx.has_flag::<DiffReviewFeatureFlag>()
             && !DisableAiSettings::is_ai_disabled_for_buffer(
                 editor.buffer.read(cx).as_singleton().as_ref(),
                 cx,
@@ -866,7 +864,32 @@ impl EditorElement {
                     cx.stop_propagation();
                     return;
                 } else {
-                    debug_panic!("drag state can never be in ready state after drag")
+                    // Mouse-up can arrive before the delayed drag transition runs.
+                    // Treat this as an ordinary selection drag instead of assuming
+                    // the state machine had a chance to enter `Dragging`.
+                    let click_point = position_map.point_for_position(*click_position);
+                    editor.selection_drag_state = SelectionDragState::None;
+                    editor.select(
+                        SelectPhase::Begin {
+                            position: click_point.nearest_valid,
+                            add: false,
+                            click_count: 1,
+                        },
+                        window,
+                        cx,
+                    );
+                    editor.select(
+                        SelectPhase::Update {
+                            position: point_for_position.nearest_valid,
+                            goal_column: point_for_position.exact_unclipped.column(),
+                            scroll_delta: Default::default(),
+                        },
+                        window,
+                        cx,
+                    );
+                    editor.select(SelectPhase::End, window, cx);
+                    cx.stop_propagation();
+                    return;
                 }
             }
             SelectionDragState::Dragging { ref selection, .. } => {

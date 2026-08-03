@@ -1,16 +1,11 @@
 use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
-    project_diff::{
-        self, CompareWithBranch, DeployBranchDiff, ReviewDiff, render_send_review_to_agent_button,
-    },
+    project_diff::{self, CompareWithBranch, DeployBranchDiff, ReviewDiff},
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
-use editor::{
-    Addon, Editor, EditorEvent, RestoreOnlyDiffHunkDelegate, SplittableEditor,
-    actions::SendReviewToAgent,
-};
+use editor::{Addon, Editor, EditorEvent, RestoreOnlyDiffHunkDelegate, SplittableEditor};
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
     Action, AnyElement, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
@@ -395,7 +390,6 @@ impl BranchDiff {
             .detach_and_notify_err(workspace, window, cx);
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn editor(&self, cx: &App) -> Entity<SplittableEditor> {
         self.diff.read(cx).editor().clone()
     }
@@ -723,11 +717,6 @@ impl Render for BranchDiffToolbar {
             return div();
         };
         let focus_handle = branch_diff.focus_handle(cx);
-        let review_count = branch_diff
-            .read(cx)
-            .diff
-            .read(cx)
-            .total_review_comment_count();
         let (additions, deletions) = branch_diff
             .read(cx)
             .diff
@@ -825,15 +814,6 @@ impl Render for BranchDiffToolbar {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.dispatch_action(&ReviewDiff, window, cx);
                         })),
-                )
-            })
-            .when(review_count > 0, |this| {
-                this.child(Divider::vertical()).child(
-                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&SendReviewToAgent, window, cx)
-                        }),
-                    ),
                 )
             })
     }

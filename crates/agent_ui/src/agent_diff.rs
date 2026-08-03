@@ -1,5 +1,11 @@
-use crate::{Keep, KeepAll, OpenAgentDiff, Reject, RejectAll};
-use acp_thread::{AcpThread, AcpThreadEvent};
+use crate::{
+    AgentPanel, Keep, KeepAll, OpenAgentDiff, Reject, RejectAll,
+    agent_review_store::{
+        AgentReviewStore, DeliveryState, ReviewCommentRecord, ReviewIdentity, ReviewRecord,
+        ReviewScope,
+    },
+};
+use acp_thread::{AcpThread, AcpThreadEvent, ThreadStatus};
 use action_log::{ActionLogTelemetry, LastRejectUndo};
 use agent_settings::AgentSettings;
 use anyhow::Result;
@@ -7,8 +13,9 @@ use buffer_diff::DiffHunkStatus;
 use collections::{HashMap, HashSet};
 use editor::{
     DiffHunkDelegate, Direction, Editor, EditorEvent, EditorSettings, MultiBuffer,
-    MultiBufferSnapshot, ResolvedDiffHunks, SelectionEffects, SplittableEditor, ToPoint,
-    actions::{GoToHunk, GoToPreviousHunk},
+    MultiBufferSnapshot, ResolvedDiffHunks, ReviewCommentPayload, SelectionEffects,
+    SplittableEditor, ToPoint,
+    actions::{GoToHunk, GoToPreviousHunk, Newline, SendReviewToAgent},
     multibuffer_context_lines,
     scroll::Autoscroll,
 };
@@ -26,10 +33,12 @@ use std::{
     any::{Any, TypeId},
     collections::hash_map::Entry,
     ops::Range,
+    path::PathBuf,
     sync::Arc,
 };
 use ui::{CommonAnimationExt, Divider, IconButtonShape, KeyBinding, Tooltip, prelude::*};
 use util::{ResultExt, truncate_and_trailoff};
+use uuid::Uuid;
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
@@ -41,13 +50,735 @@ use zed_actions::assistant::ToggleFocus;
 pub struct AgentDiffPane {
     multibuffer: Entity<MultiBuffer>,
     editor: Entity<SplittableEditor>,
+    global_comment_editor: Entity<Editor>,
     thread: Entity<AcpThread>,
+    review_comment_count: usize,
+    global_review_comments: Vec<GlobalReviewComment>,
+    next_global_review_comment_id: usize,
+    review_send_error: Option<SharedString>,
+    review_store: Option<AgentReviewStore>,
+    review_record_id: Option<Uuid>,
+    editor_comment_ids: HashMap<usize, Uuid>,
+    global_comment_ids: HashMap<usize, Uuid>,
+    editing_global_comment: Option<usize>,
+    review_lifecycle: ReviewLifecycle,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone)]
+struct GlobalReviewComment {
+    id: usize,
+    comment: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewLifecycle {
+    Busy,
+    Ready,
+    InFlight,
+    Failed,
+    OriginUnavailable,
+}
+
+impl ReviewLifecycle {
+    fn send_enabled(self) -> bool {
+        matches!(self, Self::Ready | Self::Failed)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Busy => "The originating agent is still working",
+            Self::Ready => "Ready to send review feedback",
+            Self::InFlight => "Sending review feedback…",
+            Self::Failed => "Review send failed; retry is available",
+            Self::OriginUnavailable => "Originating agent thread unavailable",
+        }
+    }
+}
+
+fn review_file_point(anchor: editor::Anchor, snapshot: &MultiBufferSnapshot) -> Option<Point> {
+    if !anchor.is_valid(snapshot) {
+        return None;
+    }
+    let point = anchor.to_point(snapshot);
+    snapshot
+        .point_to_buffer_point(point)
+        .map(|(_, point)| point)
+}
+
+fn format_review_location(hunk_line: Option<u32>, range: Option<(u32, u32)>) -> String {
+    match (hunk_line, range) {
+        (Some(hunk_line), Some((start, end))) if start == end => {
+            format!("hunk {}, line {}", hunk_line + 1, start + 1)
+        }
+        (Some(hunk_line), Some((start, end))) => {
+            format!("hunk {}, lines {}-{}", hunk_line + 1, start + 1, end + 1)
+        }
+        (Some(hunk_line), None) => format!("hunk {}", hunk_line + 1),
+        (None, Some((start, end))) if start == end => format!("line {}", start + 1),
+        (None, Some((start, end))) => format!("lines {}-{}", start + 1, end + 1),
+        (None, None) => "unavailable".to_string(),
+    }
+}
+
+pub(crate) fn format_review_comment_message(
+    comments: &[ReviewCommentPayload],
+    snapshot: &MultiBufferSnapshot,
+) -> String {
+    let mut message = String::from("Please address this review feedback:\n\n");
+    for comment in comments {
+        match &comment.target {
+            editor::ReviewCommentTarget::Hunk {
+                file_path,
+                hunk_start,
+                range,
+                original_hunk_line,
+                original_range,
+                stale,
+            } => {
+                let points = (
+                    review_file_point(*hunk_start, snapshot),
+                    review_file_point(range.start, snapshot),
+                    review_file_point(range.end, snapshot),
+                );
+                if *stale {
+                    message.push_str(&format!(
+                        "- `{}` (stale hunk; original location {}): {}\n",
+                        file_path.as_unix_str(),
+                        format_review_location(*original_hunk_line, *original_range),
+                        comment.comment
+                    ));
+                } else if let (Some(start), Some(range_start), Some(range_end)) = points {
+                    message.push_str(&format!(
+                        "- `{}` (hunk {}, lines {}-{}, active): {}\n",
+                        file_path.as_unix_str(),
+                        start.row + 1,
+                        range_start.row + 1,
+                        range_end.row + 1,
+                        comment.comment
+                    ));
+                } else {
+                    message.push_str(&format!(
+                        "- `{}` (stale hunk; original location {}): {}\n",
+                        file_path.as_unix_str(),
+                        format_review_location(*original_hunk_line, *original_range),
+                        comment.comment
+                    ));
+                }
+            }
+            editor::ReviewCommentTarget::Diff => {
+                message.push_str(&format!("- Diff: {}\n", comment.comment));
+            }
+        }
+    }
+    message
+}
+
 impl AgentDiffPane {
+    fn review_scope(thread: &Entity<AcpThread>, cx: &App) -> ReviewScope {
+        let project = thread.read(cx).project().clone();
+        let paths = project.read(cx).worktree_paths(cx);
+        let (project_path, worktree_path) = paths
+            .ordered_pairs()
+            .next()
+            .map(|(main, folder)| (Some(main.clone()), folder.clone()))
+            .unwrap_or_else(|| (None, PathBuf::from(".")));
+        ReviewScope {
+            worktree_id: None,
+            project_id: None,
+            worktree_path,
+            project_path,
+        }
+    }
+
+    fn review_generation(thread: &Entity<AcpThread>, cx: &App) -> String {
+        thread.read(cx).session_id().to_string()
+    }
+
+    fn load_review_store(
+        thread: &Entity<AcpThread>,
+        cx: &App,
+    ) -> (Option<AgentReviewStore>, Option<Uuid>) {
+        let scope = Self::review_scope(thread, cx);
+        let generation = Self::review_generation(thread, cx);
+        let mut store = match AgentReviewStore::load(scope, cx) {
+            Ok(store) => store,
+            Err(error) => {
+                log::error!("failed to load agent review state: {error:#}");
+                return (None, None);
+            }
+        };
+
+        let record_id = if let Some(record) = store.snapshot.select_current_generation(&generation)
+        {
+            Some(record.identity.review_id)
+        } else {
+            let mut identity = ReviewIdentity::new(store.scope.clone(), generation);
+            identity.session_id = Some(thread.read(cx).session_id().to_string());
+            let record = ReviewRecord::new(identity);
+            let record_id = record.identity.review_id;
+            store.snapshot.records.push(record);
+            Some(record_id)
+        };
+        (Some(store), record_id)
+    }
+
+    fn review_record_mut(&mut self) -> Option<&mut ReviewRecord> {
+        let review_record_id = self.review_record_id?;
+        self.review_store
+            .as_mut()
+            .and_then(|store| store.snapshot.select_mut(review_record_id))
+    }
+
+    fn persist_review_store(&self, cx: &App) {
+        let Some(store) = &self.review_store else {
+            return;
+        };
+        store.persist(cx).detach_and_log_err(cx);
+    }
+
+    fn refresh_review_comment_count(&mut self, cx: &App) {
+        self.review_comment_count = self
+            .review_store
+            .as_ref()
+            .and_then(|store| {
+                self.review_record_id
+                    .and_then(|id| store.snapshot.select(id))
+            })
+            .map(ReviewRecord::pending_count)
+            .unwrap_or_else(|| {
+                self.editor
+                    .read(cx)
+                    .rhs_editor()
+                    .read(cx)
+                    .review_comment_payloads(cx)
+                    .len()
+                    + self.global_review_comments.len()
+            });
+    }
+
+    fn sync_editor_review_records(&mut self, cx: &mut Context<Self>) {
+        let Some(record_id) = self.review_record_id else {
+            return;
+        };
+        let records = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comment_records(cx);
+        let Some(store) = &mut self.review_store else {
+            return;
+        };
+        let Some(record) = store.snapshot.select_mut(record_id) else {
+            return;
+        };
+        let mut seen = HashSet::default();
+        for editor_record in records {
+            seen.insert(editor_record.editor_id);
+            let id = *self
+                .editor_comment_ids
+                .entry(editor_record.editor_id)
+                .or_insert_with(Uuid::new_v4);
+            if let Some(comment) = record.comments.iter_mut().find(|comment| comment.id == id) {
+                comment.text = editor_record.comment;
+                comment.target = editor_record.target;
+                if matches!(
+                    comment.state,
+                    DeliveryState::Acknowledged | DeliveryState::Discarded
+                ) {
+                    comment.state = DeliveryState::Pending;
+                }
+            } else {
+                record.comments.push(ReviewCommentRecord {
+                    id,
+                    text: editor_record.comment,
+                    target: editor_record.target,
+                    created_at: chrono::Utc::now(),
+                    state: DeliveryState::Pending,
+                });
+            }
+        }
+        self.editor_comment_ids
+            .retain(|editor_id, _| seen.contains(editor_id));
+        record.updated_at = chrono::Utc::now();
+        self.persist_review_store(cx);
+        self.refresh_review_comment_count(cx);
+        cx.notify();
+    }
+
+    fn remove_global_review_comment(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.global_review_comments
+            .retain(|comment| comment.id != id);
+        if self.editing_global_comment == Some(id) {
+            self.editing_global_comment = None;
+        }
+        if let Some(store_id) = self.global_comment_ids.remove(&id) {
+            if let Some(record) = self.review_record_mut() {
+                record.comments.retain(|comment| comment.id != store_id);
+                record.updated_at = chrono::Utc::now();
+            }
+        }
+        self.persist_review_store(cx);
+        self.refresh_review_comment_count(cx);
+        cx.notify();
+    }
+
+    fn edit_global_review_comment(
+        &mut self,
+        id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(comment) = self
+            .global_review_comments
+            .iter()
+            .find(|comment| comment.id == id)
+        else {
+            return;
+        };
+        self.editing_global_comment = Some(id);
+        self.global_comment_editor.update(cx, |editor, cx| {
+            editor.set_text(comment.comment.clone(), window, cx)
+        });
+        self.global_comment_editor.update(cx, |editor, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn add_diff_review_comment(&mut self, comment: String, cx: &mut Context<Self>) -> bool {
+        let comment = comment.trim();
+        if comment.is_empty() {
+            return false;
+        }
+        if let Some(id) = self.editing_global_comment.take() {
+            if let Some(existing) = self
+                .global_review_comments
+                .iter_mut()
+                .find(|item| item.id == id)
+            {
+                existing.comment = comment.to_string();
+            }
+            if let Some(store_id) = self.global_comment_ids.get(&id).copied() {
+                if let Some(record) = self.review_record_mut() {
+                    if let Some(existing) =
+                        record.comments.iter_mut().find(|item| item.id == store_id)
+                    {
+                        existing.text = comment.to_string();
+                        existing.state = DeliveryState::Pending;
+                        existing.target = editor::ReviewCommentTargetData::Diff;
+                        record.updated_at = chrono::Utc::now();
+                    }
+                }
+            }
+        } else {
+            let id = self.next_global_review_comment_id;
+            self.next_global_review_comment_id += 1;
+            self.global_review_comments.push(GlobalReviewComment {
+                id,
+                comment: comment.to_string(),
+            });
+            let store_id = Uuid::new_v4();
+            self.global_comment_ids.insert(id, store_id);
+            if let Some(record) = self.review_record_mut() {
+                record.comments.push(ReviewCommentRecord {
+                    id: store_id,
+                    text: comment.to_string(),
+                    target: editor::ReviewCommentTargetData::Diff,
+                    created_at: chrono::Utc::now(),
+                    state: DeliveryState::Pending,
+                });
+                record.updated_at = chrono::Utc::now();
+            }
+        }
+        self.persist_review_store(cx);
+        self.refresh_review_comment_count(cx);
+        cx.notify();
+        true
+    }
+
+    pub fn review_comment_payloads(&self, cx: &App) -> Vec<ReviewCommentPayload> {
+        self.review_comment_batch(cx).0
+    }
+
+    fn review_comment_batch(
+        &self,
+        cx: &App,
+    ) -> (Vec<ReviewCommentPayload>, HashSet<usize>, HashSet<usize>) {
+        let mut payloads = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comment_payloads(cx);
+        let hunk_comment_ids = payloads.iter().map(|payload| payload.id).collect();
+        let next_id = payloads.iter().map(|payload| payload.id).max().unwrap_or(0) + 1;
+        let global_comment_ids = self
+            .global_review_comments
+            .iter()
+            .map(|comment| comment.id)
+            .collect();
+        payloads.extend(
+            self.global_review_comments
+                .iter()
+                .map(|comment| ReviewCommentPayload {
+                    id: next_id + comment.id,
+                    comment: comment.comment.clone(),
+                    target: editor::ReviewCommentTarget::Diff,
+                }),
+        );
+        (payloads, hunk_comment_ids, global_comment_ids)
+    }
+
+    fn clear_review_comments_with_ids(
+        &mut self,
+        hunk_comment_ids: &HashSet<usize>,
+        global_comment_ids: &HashSet<usize>,
+        store_comment_ids: &HashSet<Uuid>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut selected_store_ids = self.selected_store_ids(hunk_comment_ids, global_comment_ids);
+        selected_store_ids.extend(store_comment_ids);
+        if let Some(record) = self.review_record_mut() {
+            for comment in &mut record.comments {
+                if selected_store_ids.contains(&comment.id) {
+                    comment.state = DeliveryState::Acknowledged;
+                }
+            }
+            record.updated_at = chrono::Utc::now();
+            record.comments.retain(|comment| {
+                !matches!(
+                    comment.state,
+                    DeliveryState::Acknowledged | DeliveryState::Discarded
+                )
+            });
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.clear_review_comments_with_ids(hunk_comment_ids, cx);
+            });
+        });
+        self.global_review_comments
+            .retain(|comment| !global_comment_ids.contains(&comment.id));
+        self.editor_comment_ids
+            .retain(|_, store_id| !selected_store_ids.contains(store_id));
+        self.global_comment_ids
+            .retain(|_, store_id| !selected_store_ids.contains(store_id));
+        self.persist_review_store(cx);
+        self.refresh_review_comment_count(cx);
+        cx.notify();
+    }
+
+    fn review_send_failed(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.review_send_error = Some(message.into());
+        cx.notify();
+    }
+
+    fn originating_thread_is_busy(&self, cx: &App) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return false;
+        };
+        let session_id = self.thread.read(cx).session_id().clone();
+        panel
+            .read(cx)
+            .conversation_views()
+            .into_iter()
+            .find_map(|conversation| conversation.read(cx).thread_view(&session_id))
+            .is_some_and(|thread_view| {
+                thread_view.read(cx).thread.read(cx).status() != ThreadStatus::Idle
+            })
+    }
+
+    pub fn clear_review_comments(&mut self, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.clear_review_comments(cx);
+            });
+        });
+        self.global_review_comments.clear();
+        if let Some(record) = self.review_record_mut() {
+            for comment in &mut record.comments {
+                if !matches!(
+                    comment.state,
+                    DeliveryState::Acknowledged | DeliveryState::Discarded
+                ) {
+                    comment.state = DeliveryState::Discarded;
+                }
+            }
+            record.updated_at = chrono::Utc::now();
+            record.comments.retain(|comment| {
+                !matches!(
+                    comment.state,
+                    DeliveryState::Acknowledged | DeliveryState::Discarded
+                )
+            });
+        }
+        self.editor_comment_ids.clear();
+        self.global_comment_ids.clear();
+        self.editing_global_comment = None;
+        self.next_global_review_comment_id = 0;
+        self.review_comment_count = 0;
+        self.review_send_error = None;
+        self.persist_review_store(cx);
+        cx.notify();
+    }
+
+    fn mark_review_comments_retryable(
+        &mut self,
+        hunk_comment_ids: &HashSet<usize>,
+        global_comment_ids: &HashSet<usize>,
+        store_comment_ids: &HashSet<Uuid>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut selected_store_ids = self.selected_store_ids(hunk_comment_ids, global_comment_ids);
+        selected_store_ids.extend(store_comment_ids);
+        if let Some(record) = self.review_record_mut() {
+            for comment in &mut record.comments {
+                if selected_store_ids.contains(&comment.id) {
+                    comment.state = DeliveryState::Retryable;
+                }
+            }
+            record.updated_at = chrono::Utc::now();
+        }
+        self.review_lifecycle = ReviewLifecycle::Failed;
+        self.persist_review_store(cx);
+        cx.notify();
+    }
+
+    fn selected_store_ids(
+        &self,
+        hunk_comment_ids: &HashSet<usize>,
+        global_comment_ids: &HashSet<usize>,
+    ) -> HashSet<Uuid> {
+        self.editor_comment_ids
+            .iter()
+            .filter(|(editor_id, _)| hunk_comment_ids.contains(editor_id))
+            .map(|(_, store_id)| *store_id)
+            .chain(
+                self.global_comment_ids
+                    .iter()
+                    .filter(|(global_id, _)| global_comment_ids.contains(global_id))
+                    .map(|(_, store_id)| *store_id),
+            )
+            .collect()
+    }
+
+    fn active_store_ids(&self) -> HashSet<Uuid> {
+        self.editor_comment_ids
+            .values()
+            .chain(self.global_comment_ids.values())
+            .copied()
+            .collect()
+    }
+
+    fn durable_only_comments(&self) -> Vec<ReviewCommentRecord> {
+        let active_ids = self.active_store_ids();
+        self.review_store
+            .as_ref()
+            .and_then(|store| {
+                self.review_record_id
+                    .and_then(|id| store.snapshot.select(id))
+            })
+            .map(|record| {
+                record
+                    .comments
+                    .iter()
+                    .filter(|comment| {
+                        !active_ids.contains(&comment.id)
+                            && !matches!(
+                                comment.state,
+                                DeliveryState::Acknowledged | DeliveryState::Discarded
+                            )
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn remove_stored_review_comment(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if let Some(record) = self.review_record_mut() {
+            record.comments.retain(|comment| comment.id != id);
+            record.updated_at = chrono::Utc::now();
+        }
+        self.persist_review_store(cx);
+        self.refresh_review_comment_count(cx);
+        cx.notify();
+    }
+
+    fn send_review_to_agent(
+        &mut self,
+        _: &SendReviewToAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.review_send_error = None;
+        if !self.review_lifecycle.send_enabled() {
+            self.review_send_failed(self.review_lifecycle.label(), cx);
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.review_lifecycle = ReviewLifecycle::OriginUnavailable;
+            self.review_send_failed("The originating workspace is no longer available.", cx);
+            return;
+        };
+        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            self.review_lifecycle = ReviewLifecycle::OriginUnavailable;
+            self.review_send_failed("The originating agent thread is no longer available.", cx);
+            return;
+        };
+        let session_id = self.thread.read(cx).session_id().clone();
+        let conversation = panel
+            .read(cx)
+            .conversation_views()
+            .into_iter()
+            .find(|conversation| conversation.read(cx).thread_view(&session_id).is_some());
+        let Some(conversation) = conversation else {
+            self.review_lifecycle = ReviewLifecycle::OriginUnavailable;
+            self.review_send_failed("The originating agent thread is no longer available.", cx);
+            return;
+        };
+        let Some(thread_view) = conversation.read(cx).thread_view(&session_id) else {
+            self.review_lifecycle = ReviewLifecycle::OriginUnavailable;
+            self.review_send_failed("The originating agent thread is no longer available.", cx);
+            return;
+        };
+        if thread_view.read(cx).thread.read(cx).status() != ThreadStatus::Idle {
+            self.review_send_failed("The originating agent is still working.", cx);
+            return;
+        }
+        let (comments, hunk_comment_ids, global_comment_ids) = self.review_comment_batch(cx);
+        let durable_only_comments = self.durable_only_comments();
+        if comments.is_empty() && durable_only_comments.is_empty() {
+            self.review_send_failed("There are no pending review comments to send.", cx);
+            return;
+        }
+        let rhs_editor = self.editor.read(cx).rhs_editor().clone();
+        let snapshot = rhs_editor.read(cx).buffer().read(cx).snapshot(cx);
+        let mut message = format_review_comment_message(&comments, &snapshot);
+        for comment in &durable_only_comments {
+            let location = match &comment.target {
+                editor::ReviewCommentTargetData::Hunk {
+                    file_path,
+                    original_hunk_line,
+                    original_range,
+                    stale,
+                    ..
+                } => format!(
+                    "`{}` ({}, original location {})",
+                    file_path,
+                    if *stale { "stale hunk" } else { "hunk" },
+                    format_review_location(*original_hunk_line, *original_range),
+                ),
+                editor::ReviewCommentTargetData::Diff => "Diff".to_string(),
+            };
+            message.push_str(&format!("- {location}: {}\n", comment.text));
+        }
+        let mut selected_store_ids =
+            self.selected_store_ids(&hunk_comment_ids, &global_comment_ids);
+        selected_store_ids.extend(durable_only_comments.iter().map(|comment| comment.id));
+        if let Some(record) = self.review_record_mut() {
+            for comment in &mut record.comments {
+                if selected_store_ids.contains(&comment.id) {
+                    comment.state = DeliveryState::InFlight;
+                }
+            }
+            record.updated_at = chrono::Utc::now();
+        }
+        self.review_lifecycle = ReviewLifecycle::InFlight;
+        self.persist_review_store(cx);
+        let review_scope = self.review_store.as_ref().map(|store| store.scope.clone());
+        let selected_store_ids = selected_store_ids.into_iter().collect::<Vec<_>>();
+        let selected_store_ids_for_pane =
+            selected_store_ids.iter().copied().collect::<HashSet<_>>();
+        let selected_store_ids_for_reject = selected_store_ids_for_pane.clone();
+        let pane = cx.entity().downgrade();
+        let hunk_comment_ids_for_failure = hunk_comment_ids.clone();
+        let global_comment_ids_for_failure = global_comment_ids.clone();
+        let hunk_comment_ids_for_success = hunk_comment_ids.clone();
+        let global_comment_ids_for_success = global_comment_ids.clone();
+        let accepted = thread_view.update(cx, |thread_view, cx| {
+            thread_view.send_review_message(
+                message,
+                Box::new(move |success, cx| {
+                    if success {
+                        let pane_updated = pane.update(cx, |pane, cx| {
+                            pane.clear_review_comments_with_ids(
+                                &hunk_comment_ids_for_success,
+                                &global_comment_ids_for_success,
+                                &selected_store_ids_for_pane,
+                                cx,
+                            )
+                        });
+                        if pane_updated.is_err() {
+                            if let Some(scope) = review_scope.clone() {
+                                AgentReviewStore::update_delivery_state(
+                                    scope,
+                                    selected_store_ids.clone(),
+                                    DeliveryState::Acknowledged,
+                                    cx,
+                                )
+                                .detach_and_log_err(cx);
+                            }
+                        }
+                    } else {
+                        let pane_updated = pane.update(cx, |pane, cx| {
+                            pane.mark_review_comments_retryable(
+                                &hunk_comment_ids_for_failure,
+                                &global_comment_ids_for_failure,
+                                &selected_store_ids_for_pane,
+                                cx,
+                            );
+                        });
+                        if pane_updated.is_err() {
+                            if let Some(scope) = review_scope {
+                                AgentReviewStore::update_delivery_state(
+                                    scope,
+                                    selected_store_ids,
+                                    DeliveryState::Retryable,
+                                    cx,
+                                )
+                                .detach_and_log_err(cx);
+                            }
+                        }
+                    }
+                }),
+                window,
+                cx,
+            )
+        });
+        if !accepted {
+            self.mark_review_comments_retryable(
+                &hunk_comment_ids,
+                &global_comment_ids,
+                &selected_store_ids_for_reject,
+                cx,
+            );
+            self.review_send_failed(
+                "The review could not be sent; the agent may be busy or have an unsent draft.",
+                cx,
+            );
+            return;
+        }
+        conversation.update(cx, |conversation, cx| {
+            conversation.navigate_to_thread(session_id, window, cx);
+        });
+    }
+
+    fn submit_global_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let comment = self.global_comment_editor.read(cx).text(cx);
+        if self.add_diff_review_comment(comment, cx) {
+            self.global_comment_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+        }
+    }
+
     pub fn deploy(
         thread: Entity<AcpThread>,
         workspace: WeakEntity<Workspace>,
@@ -102,13 +833,42 @@ impl AgentDiffPane {
             );
             diff_display_editor
                 .set_diff_hunk_delegate(Some(agent_diff_delegate(&thread, workspace.clone())), cx);
+            diff_display_editor.rhs_editor().update(cx, |editor, cx| {
+                editor.set_show_diff_review_button(true, cx);
+            });
             diff_display_editor.update_editors(cx, |editor, _cx| {
                 editor.register_addon(AgentDiffAddon);
             });
             diff_display_editor
         });
+        let global_comment_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Add a comment about the entire diff…", window, cx);
+            editor
+        });
+        let parent = cx.entity().downgrade();
+        let global_comment_subscription = global_comment_editor.update(cx, |editor, _cx| {
+            editor.register_action(move |_: &Newline, window, cx| {
+                if let Some(parent) = parent.upgrade() {
+                    parent.update(cx, |pane, cx| pane.submit_global_comment(window, cx));
+                }
+            })
+        });
 
         let action_log = thread.read(cx).action_log().clone();
+        let rhs_editor = editor.read(cx).rhs_editor().clone();
+
+        let (review_store, review_record_id) = Self::load_review_store(&thread, cx);
+        let recovered_review_count = review_store
+            .as_ref()
+            .and_then(|store| review_record_id.and_then(|id| store.snapshot.select(id)))
+            .map(ReviewRecord::pending_count)
+            .unwrap_or_default();
+        let review_lifecycle = if thread.read(cx).status() == ThreadStatus::Idle {
+            ReviewLifecycle::Ready
+        } else {
+            ReviewLifecycle::Busy
+        };
 
         let mut this = Self {
             _subscriptions: vec![
@@ -118,13 +878,53 @@ impl AgentDiffPane {
                 cx.subscribe(&thread, |this, _thread, event, cx| {
                     this.handle_acp_thread_event(event, cx)
                 }),
+                cx.subscribe(&rhs_editor, |this, _editor, event: &EditorEvent, cx| {
+                    if let EditorEvent::ReviewCommentsChanged { total_count } = event {
+                        this.sync_editor_review_records(cx);
+                        if this.review_store.is_none() {
+                            this.review_comment_count =
+                                *total_count + this.global_review_comments.len();
+                        }
+                    }
+                }),
+                global_comment_subscription,
             ],
             multibuffer,
             editor,
+            global_comment_editor,
             thread,
+            review_comment_count: recovered_review_count,
+            global_review_comments: Vec::new(),
+            next_global_review_comment_id: 0,
+            review_send_error: None,
+            review_store,
+            review_record_id,
+            editor_comment_ids: HashMap::default(),
+            global_comment_ids: HashMap::default(),
+            editing_global_comment: None,
+            review_lifecycle,
             focus_handle,
             workspace,
         };
+        if let (Some(store), Some(record_id)) = (&this.review_store, this.review_record_id) {
+            if let Some(record) = store.snapshot.select(record_id) {
+                for comment in record.comments.iter().filter(|comment| {
+                    matches!(comment.target, editor::ReviewCommentTargetData::Diff)
+                        && !matches!(
+                            comment.state,
+                            DeliveryState::Acknowledged | DeliveryState::Discarded
+                        )
+                }) {
+                    let id = this.next_global_review_comment_id;
+                    this.next_global_review_comment_id += 1;
+                    this.global_comment_ids.insert(id, comment.id);
+                    this.global_review_comments.push(GlobalReviewComment {
+                        id,
+                        comment: comment.text.clone(),
+                    });
+                }
+            }
+        }
         this.update_excerpts(window, cx);
         this
     }
@@ -236,8 +1036,19 @@ impl AgentDiffPane {
     }
 
     fn handle_acp_thread_event(&mut self, event: &AcpThreadEvent, cx: &mut Context<Self>) {
-        if let AcpThreadEvent::TitleUpdated = event {
-            cx.emit(EditorEvent::TitleChanged);
+        match event {
+            AcpThreadEvent::TitleUpdated => cx.emit(EditorEvent::TitleChanged),
+            AcpThreadEvent::StatusChanged | AcpThreadEvent::Stopped(_) => {
+                if self.review_lifecycle != ReviewLifecycle::InFlight {
+                    self.review_lifecycle = if self.thread.read(cx).status() == ThreadStatus::Idle {
+                        ReviewLifecycle::Ready
+                    } else {
+                        ReviewLifecycle::Busy
+                    };
+                }
+                cx.notify();
+            }
+            _ => {}
         }
     }
 
@@ -594,7 +1405,7 @@ impl Item for AgentDiffPane {
     }
 
     fn can_split(&self) -> bool {
-        true
+        self.review_comment_count == 0
     }
 
     fn clone_on_split(
@@ -696,15 +1507,18 @@ impl Render for AgentDiffPane {
             .on_action(cx.listener(Self::reject))
             .on_action(cx.listener(Self::reject_all))
             .on_action(cx.listener(Self::keep_all))
+            .on_action(cx.listener(Self::send_review_to_agent))
             // Only paint the background for the empty state. When the diff editor
             // is shown it already paints `editor_background`; painting it again
             // here double-composites into a darker patch on transparent windows.
-            .when(is_empty, |el| el.bg(cx.theme().colors().editor_background))
+            .when(is_empty && self.review_comment_count == 0, |el| {
+                el.bg(cx.theme().colors().editor_background)
+            })
             .flex()
             .items_center()
             .justify_center()
             .size_full()
-            .when(is_empty, |el| {
+            .when(is_empty && self.review_comment_count == 0, |el| {
                 el.child(
                     v_flex()
                         .items_center()
@@ -730,7 +1544,144 @@ impl Render for AgentDiffPane {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty || self.review_comment_count > 0, |el| {
+                el.child(
+                    v_flex()
+                        .size_full()
+                        .when(!is_empty, |this| {
+                            this.child(div().flex_1().child(self.editor.clone()))
+                        })
+                        .child(
+                            v_flex()
+                                .border_t_1()
+                                .border_color(cx.theme().colors().border)
+                                .p_1()
+                                .child(
+                                    Label::new(self.review_lifecycle.label())
+                                        .size(LabelSize::Small)
+                                        .color(if self.review_lifecycle.send_enabled() {
+                                            Color::Muted
+                                        } else {
+                                            Color::Warning
+                                        }),
+                                )
+                                .children(self.global_review_comments.iter().map(|comment| {
+                                    let id = comment.id;
+                                    h_flex()
+                                        .w_full()
+                                        .gap_1()
+                                        .child(
+                                            div().flex_1().text_sm().child(comment.comment.clone()),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                ("edit-review-comment", id),
+                                                IconName::Pencil,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text("Edit review comment"))
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.edit_global_review_comment(id, window, cx);
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                ("delete-review-comment", id),
+                                                IconName::Trash,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text("Delete review comment"))
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.remove_global_review_comment(id, cx);
+                                                }),
+                                            ),
+                                        )
+                                }))
+                                .children(self.durable_only_comments().iter().map(|comment| {
+                                    let id = comment.id;
+                                    let location = match &comment.target {
+                                        editor::ReviewCommentTargetData::Hunk {
+                                            file_path,
+                                            original_hunk_line,
+                                            original_range,
+                                            stale,
+                                            ..
+                                        } => format!(
+                                            "{} · {}{}",
+                                            file_path,
+                                            if *stale { "stale " } else { "" },
+                                            format_review_location(
+                                                *original_hunk_line,
+                                                *original_range,
+                                            )
+                                        ),
+                                        editor::ReviewCommentTargetData::Diff => "Diff".to_string(),
+                                    };
+                                    h_flex()
+                                        .w_full()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_sm()
+                                                .child(format!("{location}: {}", comment.text)),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                (
+                                                    "delete-stored-review-comment",
+                                                    id.as_u128() as usize,
+                                                ),
+                                                IconName::Trash,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text("Delete review comment"))
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.remove_stored_review_comment(id, cx);
+                                                }),
+                                            ),
+                                        )
+                                }))
+                                .when_some(self.review_send_error.clone(), |this, error| {
+                                    this.child(
+                                        Label::new(error)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Error),
+                                    )
+                                })
+                                .child(self.global_comment_editor.clone())
+                                .when(self.review_comment_count > 0, |this| {
+                                    this.child(
+                                        h_flex().justify_end().child(
+                                            Button::new(
+                                                "submit-review-comments",
+                                                "Submit comments",
+                                            )
+                                            .style(ButtonStyle::Outlined)
+                                            .label_size(LabelSize::Small)
+                                            .disabled(
+                                                self.originating_thread_is_busy(cx)
+                                                    || !self.review_lifecycle.send_enabled(),
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.send_review_to_agent(
+                                                        &SendReviewToAgent,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                        ),
+                                    )
+                                }),
+                        ),
+                )
+            })
     }
 }
 
@@ -966,6 +1917,7 @@ impl editor::Addon for AgentDiffAddon {
 pub struct AgentDiffToolbar {
     active_item: Option<AgentDiffToolbarItem>,
     _settings_subscription: Subscription,
+    _pane_subscription: Option<Subscription>,
 }
 
 pub enum AgentDiffToolbarItem {
@@ -982,6 +1934,7 @@ impl AgentDiffToolbar {
         Self {
             active_item: None,
             _settings_subscription: cx.observe_global::<SettingsStore>(Self::update_location),
+            _pane_subscription: None,
         }
     }
 
@@ -1053,6 +2006,9 @@ impl ToolbarItemView for AgentDiffToolbar {
         if let Some(item) = active_pane_item {
             if let Some(pane) = item.act_as::<AgentDiffPane>(cx) {
                 self.active_item = Some(AgentDiffToolbarItem::Pane(pane.downgrade()));
+                self._pane_subscription = Some(cx.observe(&pane, |_this, _pane, cx| {
+                    cx.notify();
+                }));
                 return self.location(cx);
             }
 
@@ -1066,12 +2022,14 @@ impl ToolbarItemView for AgentDiffToolbar {
                     state: agent_diff.read(cx).editor_state(&editor.downgrade()),
                     _diff_subscription: cx.observe(&agent_diff, Self::handle_diff_notify),
                 });
+                self._pane_subscription = None;
 
                 return self.location(cx);
             }
         }
 
         self.active_item = None;
+        self._pane_subscription = None;
         self.location(cx)
     }
 
@@ -1236,11 +2194,37 @@ impl Render for AgentDiffToolbar {
                 }
 
                 let is_empty = agent_diff.read(cx).multibuffer.read(cx).is_empty();
-                if is_empty {
+                let review_comment_count = agent_diff.read(cx).review_comment_count;
+                if is_empty && review_comment_count == 0 {
                     return Empty.into_any();
                 }
 
                 let focus_handle = agent_diff.focus_handle(cx);
+                let thread_is_busy = agent_diff.read(cx).originating_thread_is_busy(cx);
+                let review_send_enabled = agent_diff.read(cx).review_lifecycle.send_enabled();
+                let agent_diff_for_review = agent_diff.clone();
+                let review_button = (review_comment_count > 0).then(|| {
+                    Button::new(
+                        "send-review",
+                        format!("Send Review to Agent ({review_comment_count})"),
+                    )
+                    .start_icon(
+                        Icon::new(IconName::ZedAssistant)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::for_action_title_in(
+                        "Send all review comments to the originating agent thread",
+                        &SendReviewToAgent,
+                        &focus_handle,
+                    ))
+                    .on_click(move |_, window, cx| {
+                        agent_diff_for_review.update(cx, |agent_diff, cx| {
+                            agent_diff.send_review_to_agent(&SendReviewToAgent, window, cx);
+                        });
+                    })
+                    .disabled(thread_is_busy || !review_send_enabled)
+                });
 
                 h_group_xl()
                     .my_neg_1()
@@ -1270,6 +2254,9 @@ impl Render for AgentDiffToolbar {
                                     })),
                             ),
                     )
+                    .when_some(review_button, |this, button| {
+                        this.child(Divider::vertical()).child(button)
+                    })
                     .into_any()
             }
         }

@@ -66,7 +66,7 @@ use chrono::{DateTime, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
-use editor::{Editor, MultiBuffer};
+use editor::{Editor, MultiBuffer, actions::SendReviewToAgent};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -461,6 +461,9 @@ pub fn init(cx: &mut App) {
                         AgentDiffPane::deploy_in_workspace(thread, workspace, window, cx);
                     }
                 })
+                .register_action(|workspace, _: &SendReviewToAgent, window, cx| {
+                    send_git_review_to_active_agent(workspace, window, cx);
+                })
                 .register_action(|workspace, _: &ToggleOptionsMenu, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
@@ -758,6 +761,34 @@ pub fn init(cx: &mut App) {
         },
     )
     .detach();
+}
+
+fn send_git_review_to_active_agent(
+    workspace: &mut Workspace,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    show_review_toast(
+        workspace,
+        "Review comments can only be sent from an agent-produced diff.",
+        cx,
+    );
+}
+
+fn show_review_toast(
+    workspace: &mut Workspace,
+    message: &'static str,
+    cx: &mut Context<Workspace>,
+) {
+    struct ReviewToast;
+    workspace.show_toast(
+        workspace::Toast::new(
+            workspace::notifications::NotificationId::unique::<ReviewToast>(),
+            message,
+        )
+        .autohide(),
+        cx,
+    );
 }
 
 fn format_selection_for_terminal(

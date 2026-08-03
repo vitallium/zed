@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus, DiffHunkStatus, DiffHunkStatusKind};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use fs::Fs as _;
 use futures::{StreamExt, channel::oneshot};
 use gpui::{
@@ -40041,6 +40041,72 @@ fn test_review_comment_take_all(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comment_payloads_are_non_destructive_and_clear_on_success(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    _ = editor.update(cx, |editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let key = test_hunk_key_with_anchor("src/lib.rs", snapshot.anchor_before(Point::new(0, 0)));
+        add_test_comment(editor, key, "Preserve the fallback", cx);
+
+        let payloads = editor.review_comment_payloads(cx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(editor.total_review_comment_count(), 1);
+        assert_eq!(payloads[0].comment, "Preserve the fallback");
+        assert!(matches!(
+            &payloads[0].target,
+            ReviewCommentTarget::Hunk { file_path, stale: false, .. }
+                if file_path.as_ref().as_unix_str() == "src/lib.rs"
+        ));
+
+        editor.clear_review_comments(cx);
+        assert!(editor.review_comment_payloads(cx).is_empty());
+        assert_eq!(editor.total_review_comment_count(), 0);
+    });
+}
+
+#[test]
+fn test_review_comment_target_data_round_trip() {
+    let target = ReviewCommentTargetData::Hunk {
+        file_path: "src/lib.rs".to_string(),
+        original_hunk_line: Some(12),
+        original_range: Some((13, 15)),
+        resolved_hunk_line: Some(14),
+        resolved_range: Some((15, 17)),
+        content_context: Some("fn main() {}".to_string()),
+        stale: false,
+    };
+
+    let encoded = serde_json::to_string(&target).unwrap();
+    let decoded: ReviewCommentTargetData = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, target);
+}
+
+#[gpui::test]
+fn test_review_comment_clear_by_id_preserves_newer_comments(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    _ = editor.update(cx, |editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let key = test_hunk_key_with_anchor("src/lib.rs", snapshot.anchor_before(Point::zero()));
+        let first_id = add_test_comment(editor, key.clone(), "First", cx);
+        let second_id = add_test_comment(editor, key, "Second", cx);
+
+        let mut sent_ids = HashSet::default();
+        sent_ids.insert(first_id);
+        editor.clear_review_comments_with_ids(&sent_ids, cx);
+
+        let payloads = editor.review_comment_payloads(cx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].id, second_id);
+        assert_eq!(payloads[0].comment, "Second");
+    });
+}
+
+#[gpui::test]
 fn test_diff_review_overlay_show_and_dismiss(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -40162,6 +40228,36 @@ fn test_diff_review_empty_comment_not_submitted(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_diff_review_comment_button_submits_without_prompt_focus(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review overlay should have a prompt editor");
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Comment after recovery", window, cx);
+            });
+
+            // Simulate focus being restored to the main editor after a crash.
+            window.focus(&editor.focus_handle(cx), cx);
+            editor.submit_diff_review_comment_for_prompt(&prompt_editor, window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(editor.total_review_comment_count(), 1);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_inline_edit_flow(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -40251,8 +40347,21 @@ fn test_orphaned_comments_are_cleaned_up(cx: &mut TestAppContext) {
     editor
         .update(cx, |editor, _window, cx| {
             editor.cleanup_orphaned_review_comments(cx);
-            // Comment should be removed because its anchor is invalid
-            assert_eq!(editor.total_review_comment_count(), 0);
+            // The comment remains available and is marked stale when exported.
+            assert_eq!(editor.total_review_comment_count(), 1);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let key = test_hunk_key("");
+            assert_eq!(editor.hunk_comment_count(&key, &snapshot), 0);
+            assert!(editor.comments_for_hunk(&key, &snapshot).is_empty());
+            assert!(
+                editor
+                    .review_comment_payloads(cx)
+                    .iter()
+                    .any(|payload| matches!(
+                        payload.target,
+                        ReviewCommentTarget::Hunk { stale: true, .. }
+                    ))
+            );
         })
         .unwrap();
 }
@@ -40294,10 +40403,18 @@ fn test_orphaned_comments_cleanup_called_on_buffer_edit(cx: &mut TestAppContext)
 
     // Verify cleanup happened automatically (not manually triggered)
     editor
-        .update(cx, |editor, _window, _cx| {
-            // Comment should be removed because its anchor became invalid
-            // and cleanup was called automatically on buffer edit
-            assert_eq!(editor.total_review_comment_count(), 0);
+        .update(cx, |editor, _window, cx| {
+            // The comment remains available and is marked stale after automatic cleanup.
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert!(
+                editor
+                    .review_comment_payloads(cx)
+                    .iter()
+                    .any(|payload| matches!(
+                        payload.target,
+                        ReviewCommentTarget::Hunk { stale: true, .. }
+                    ))
+            );
         })
         .unwrap();
 }

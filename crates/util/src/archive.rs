@@ -117,30 +117,93 @@ pub async fn extract_seekable_zip<R: AsyncRead + AsyncSeek + Unpin>(
                 .with_context(|| format!("no parent directory for {path:?}"))?;
             std::fs::create_dir_all(parent_dir)
                 .with_context(|| format!("creating parent directory {parent_dir:?}"))?;
-            let mut file = smol::fs::File::create(&path)
-                .await
-                .with_context(|| format!("creating file {path:?}"))?;
             let mut entry_reader = reader
                 .reader_with_entry(i)
                 .await
                 .with_context(|| format!("reading entry for path {path:?}"))?;
+
+            #[cfg(unix)]
+            if entry
+                .unix_permissions()
+                .is_some_and(|permissions| permissions & 0o170000 == 0o120000)
+            {
+                use std::os::unix::fs::symlink;
+
+                let mut target = Vec::new();
+                futures::AsyncReadExt::read_to_end(&mut entry_reader, &mut target)
+                    .await
+                    .with_context(|| format!("reading symlink target for path {path:?}"))?;
+                let target = std::str::from_utf8(&target)
+                    .with_context(|| format!("reading symlink target for path {path:?}"))?;
+                let target_path = Path::new(target);
+                anyhow::ensure!(
+                    symlink_target_is_within_destination(destination, &path, target_path),
+                    "symlink target escapes extraction directory: {path:?} -> {target:?}"
+                );
+                symlink(target_path, &path)
+                    .with_context(|| format!("creating symlink {path:?} -> {target:?}"))?;
+            } else {
+                let mut file = smol::fs::File::create(&path)
+                    .await
+                    .with_context(|| format!("creating file {path:?}"))?;
+                futures::io::copy(&mut entry_reader, &mut file)
+                    .await
+                    .with_context(|| format!("extracting into file {path:?}"))?;
+
+                if let Some(perms) = entry.unix_permissions()
+                    && perms != 0o000
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let permissions = std::fs::Permissions::from_mode(u32::from(perms));
+                    file.set_permissions(permissions)
+                        .await
+                        .with_context(|| format!("setting permissions for file {path:?}"))?;
+                }
+            }
+
+            #[cfg(not(unix))]
+            let mut file = smol::fs::File::create(&path)
+                .await
+                .with_context(|| format!("creating file {path:?}"))?;
+
+            #[cfg(not(unix))]
             futures::io::copy(&mut entry_reader, &mut file)
                 .await
                 .with_context(|| format!("extracting into file {path:?}"))?;
-
-            if let Some(perms) = entry.unix_permissions()
-                && perms != 0o000
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = std::fs::Permissions::from_mode(u32::from(perms));
-                file.set_permissions(permissions)
-                    .await
-                    .with_context(|| format!("setting permissions for file {path:?}"))?;
-            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_target_is_within_destination(
+    destination: &Path,
+    link_path: &Path,
+    target: &Path,
+) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+
+    let Some(link_parent) = link_path
+        .parent()
+        .and_then(|path| path.strip_prefix(destination).ok())
+    else {
+        return false;
+    };
+
+    let mut depth = 0;
+    for component in link_parent.components().chain(target.components()) {
+        match component {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if depth > 0 => depth -= 1,
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -275,6 +338,48 @@ mod tests {
             assert!(extracted_path.exists());
             let extracted_perms = std::fs::metadata(&extracted_path).unwrap().permissions();
             assert_eq!(extracted_perms.mode() & 0o777, 0o755);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_zip_preserves_symlinks() {
+        smol::block_on(async {
+            let mut archive = Cursor::new(Vec::new());
+            let mut writer = ZipFileWriter::new(&mut archive);
+            let target = ZipEntryBuilder::new(
+                "Python.framework/Versions/3.12/Python".into(),
+                async_zip::Compression::Stored,
+            );
+            writer
+                .write_entry_whole(target, b"python binary")
+                .await
+                .unwrap();
+            let link = ZipEntryBuilder::new("Python".into(), async_zip::Compression::Stored)
+                .unix_permissions(0o120777);
+            writer
+                .write_entry_whole(link, b"Python.framework/Versions/3.12/Python")
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
+            archive.set_position(0);
+
+            let extract_dir = tempfile::tempdir().unwrap();
+            extract_seekable_zip(extract_dir.path(), archive)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                std::fs::read_link(extract_dir.path().join("Python")).unwrap(),
+                Path::new("Python.framework/Versions/3.12/Python")
+            );
+            assert!(
+                std::fs::symlink_metadata(extract_dir.path().join("Python"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_file_content(&extract_dir.path().join("Python"), "python binary");
         });
     }
 

@@ -1020,6 +1020,8 @@ fn sanitize_path_component(input: &str) -> String {
     }
 }
 
+const ARCHIVE_CACHE_FORMAT_VERSION: u8 = 2;
+
 fn versioned_archive_cache_dir(
     base_dir: &Path,
     version: Option<&str>,
@@ -1042,9 +1044,10 @@ fn versioned_archive_cache_dir(
     let archive_hash = format!("{:x}", archive_hasher.finalize());
 
     base_dir.join(format!(
-        "v_{sanitized_version}_{}_{}",
+        "v_{sanitized_version}_{}_{}_{}",
         &version_hash[..16],
         &archive_hash[..16],
+        ARCHIVE_CACHE_FORMAT_VERSION,
     ))
 }
 

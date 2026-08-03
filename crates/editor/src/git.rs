@@ -298,6 +298,61 @@ pub(super) struct DiffHunkKey {
     pub(super) hunk_start_anchor: Anchor,
 }
 
+/// A diff-review target that can be persisted without retaining GPUI anchors.
+///
+/// The current rows are only a projection of the persisted original location. A
+/// consumer must treat a missing or mismatched projection as stale rather than
+/// retargeting the comment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewCommentTargetData {
+    Hunk {
+        file_path: String,
+        original_hunk_line: Option<u32>,
+        original_range: Option<(u32, u32)>,
+        resolved_hunk_line: Option<u32>,
+        resolved_range: Option<(u32, u32)>,
+        content_context: Option<String>,
+        stale: bool,
+    },
+    Diff,
+}
+
+/// A review comment record exposed at the editor/store boundary.
+///
+/// `editor_id` is intentionally transient. The agent review store maps it to
+/// its own durable comment ID and never persists editor anchors or IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCommentRecord {
+    pub editor_id: usize,
+    pub comment: String,
+    pub target: ReviewCommentTargetData,
+}
+
+/// The target of a review comment collected from an editor diff.
+#[derive(Clone, Debug)]
+pub enum ReviewCommentTarget {
+    /// A comment attached to a changed hunk and range within its file.
+    Hunk {
+        file_path: Arc<util::rel_path::RelPath>,
+        hunk_start: Anchor,
+        range: Range<Anchor>,
+        original_hunk_line: Option<u32>,
+        original_range: Option<(u32, u32)>,
+        /// Set when an edit invalidated one of the comment's anchors.
+        stale: bool,
+    },
+    /// A comment about the complete diff, without a file or line target.
+    Diff,
+}
+
+/// A review comment ready to be handed to another surface.
+#[derive(Clone, Debug)]
+pub struct ReviewCommentPayload {
+    pub id: usize,
+    pub comment: String,
+    pub target: ReviewCommentTarget,
+}
+
 /// A review comment stored locally before being sent to the Agent panel.
 #[derive(Clone)]
 pub(super) struct StoredReviewComment {
@@ -307,6 +362,12 @@ pub(super) struct StoredReviewComment {
     pub(super) comment: String,
     /// Anchors for the code range being reviewed.
     pub(super) range: Range<Anchor>,
+    /// File-relative line information captured when the comment was created.
+    pub(super) original_hunk_line: Option<u32>,
+    pub(super) original_range: Option<(u32, u32)>,
+    /// Normalized content captured when the comment was created. This allows
+    /// callers to detect same-row target changes after a diff refresh.
+    pub(super) content_context: Option<String>,
     /// Whether this comment is currently being edited inline.
     pub(super) is_editing: bool,
 }
@@ -347,14 +408,33 @@ impl DiffReviewDragState {
 }
 
 impl StoredReviewComment {
-    fn new(id: usize, comment: String, anchor_range: Range<Anchor>) -> Self {
+    fn new(
+        id: usize,
+        comment: String,
+        anchor_range: Range<Anchor>,
+        original_hunk_line: Option<u32>,
+        original_range: Option<(u32, u32)>,
+        content_context: Option<String>,
+    ) -> Self {
         Self {
             id,
             comment,
             range: anchor_range,
+            original_hunk_line,
+            original_range,
+            content_context,
             is_editing: false,
         }
     }
+}
+
+fn normalized_text_context(snapshot: &MultiBufferSnapshot, range: Range<Anchor>) -> Option<String> {
+    if !range.start.is_valid(snapshot) || !range.end.is_valid(snapshot) {
+        return None;
+    }
+    let context = snapshot.text_for_range(range).collect::<String>();
+    let context = context.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!context.is_empty()).then_some(context)
 }
 
 impl Editor {
@@ -834,6 +914,32 @@ impl Editor {
         let Some(overlay_index) = overlay_index else {
             return;
         };
+        self.submit_diff_review_comment_at_overlay(overlay_index, window, cx);
+    }
+
+    pub(super) fn submit_diff_review_comment_for_prompt(
+        &mut self,
+        prompt_editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt_editor_id = prompt_editor.entity_id();
+        let overlay_index = self
+            .diff_review_overlays
+            .iter()
+            .position(|overlay| overlay.prompt_editor.entity_id() == prompt_editor_id);
+        let Some(overlay_index) = overlay_index else {
+            return;
+        };
+        self.submit_diff_review_comment_at_overlay(overlay_index, window, cx);
+    }
+
+    fn submit_diff_review_comment_at_overlay(
+        &mut self,
+        overlay_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let overlay = &self.diff_review_overlays[overlay_index];
 
         let comment_text = overlay.prompt_editor.read(cx).text(cx).trim().to_string();
@@ -895,16 +1001,42 @@ impl Editor {
         let id = self.next_review_comment_id;
         self.next_review_comment_id += 1;
 
-        let stored_comment = StoredReviewComment::new(id, comment, anchor_range);
-
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let key_point = hunk_key.hunk_start_anchor.to_point(&snapshot);
+        let file_point = |anchor: Anchor| {
+            if !anchor.is_valid(&snapshot) {
+                return None;
+            }
+            snapshot
+                .point_to_buffer_point(anchor.to_point(&snapshot))
+                .map(|(_, point)| point)
+        };
+        let original_hunk_line = file_point(hunk_key.hunk_start_anchor).map(|point| point.row);
+        let original_range = file_point(anchor_range.start)
+            .zip(file_point(anchor_range.end))
+            .map(|(start, end)| (start.row, end.row));
+        let content_context = normalized_text_context(&snapshot, anchor_range.clone());
+        let stored_comment = StoredReviewComment::new(
+            id,
+            comment,
+            anchor_range,
+            original_hunk_line,
+            original_range,
+            content_context,
+        );
+
+        let key_point = hunk_key
+            .hunk_start_anchor
+            .is_valid(&snapshot)
+            .then(|| hunk_key.hunk_start_anchor.to_point(&snapshot));
 
         // Find existing entry for this hunk or add a new one
-        if let Some((_, comments)) = self.stored_review_comments.iter_mut().find(|(k, _)| {
-            k.file_path == hunk_key.file_path
-                && k.hunk_start_anchor.to_point(&snapshot) == key_point
-        }) {
+        if let Some(key_point) = key_point
+            && let Some((_, comments)) = self.stored_review_comments.iter_mut().find(|(k, _)| {
+                k.file_path == hunk_key.file_path
+                    && k.hunk_start_anchor.is_valid(&snapshot)
+                    && k.hunk_start_anchor.to_point(&snapshot) == key_point
+            })
+        {
             comments.push(stored_comment);
         } else {
             self.stored_review_comments
@@ -1268,11 +1400,16 @@ impl Editor {
         key: &DiffHunkKey,
         snapshot: &MultiBufferSnapshot,
     ) -> &'a [StoredReviewComment] {
+        if !key.hunk_start_anchor.is_valid(snapshot) {
+            return &[];
+        }
         let key_point = key.hunk_start_anchor.to_point(snapshot);
         self.stored_review_comments
             .iter()
             .find(|(k, _)| {
-                k.file_path == key.file_path && k.hunk_start_anchor.to_point(snapshot) == key_point
+                k.file_path == key.file_path
+                    && k.hunk_start_anchor.is_valid(snapshot)
+                    && k.hunk_start_anchor.to_point(snapshot) == key_point
             })
             .map(|(_, comments)| comments.as_slice())
             .unwrap_or(&[])
@@ -1284,11 +1421,16 @@ impl Editor {
         key: &DiffHunkKey,
         snapshot: &MultiBufferSnapshot,
     ) -> usize {
+        if !key.hunk_start_anchor.is_valid(snapshot) {
+            return 0;
+        }
         let key_point = key.hunk_start_anchor.to_point(snapshot);
         self.stored_review_comments
             .iter()
             .find(|(k, _)| {
-                k.file_path == key.file_path && k.hunk_start_anchor.to_point(snapshot) == key_point
+                k.file_path == key.file_path
+                    && k.hunk_start_anchor.is_valid(snapshot)
+                    && k.hunk_start_anchor.to_point(snapshot) == key_point
             })
             .map(|(_, v)| v.len())
             .unwrap_or(0)
@@ -1346,35 +1488,11 @@ impl Editor {
         }
     }
 
-    /// Removes review comments whose anchors are no longer valid or whose
-    /// associated diff hunks no longer exist.
-    ///
-    /// This should be called when the buffer changes to prevent orphaned comments
-    /// from accumulating.
+    /// Marks review comments as stale through their anchors instead of deleting
+    /// them. This keeps feedback available for the next agent handoff after an
+    /// edit invalidates the original range.
     pub(super) fn cleanup_orphaned_review_comments(&mut self, cx: &mut Context<Self>) {
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        let original_count = self.total_review_comment_count();
-
-        // Remove comments with invalid hunk anchors
-        self.stored_review_comments
-            .retain(|(hunk_key, _)| hunk_key.hunk_start_anchor.is_valid(&snapshot));
-
-        // Also clean up individual comments with invalid anchor ranges
-        for (_, comments) in &mut self.stored_review_comments {
-            comments.retain(|comment| {
-                comment.range.start.is_valid(&snapshot) && comment.range.end.is_valid(&snapshot)
-            });
-        }
-
-        // Remove empty hunk entries
-        self.stored_review_comments
-            .retain(|(_, comments)| !comments.is_empty());
-
-        let new_count = self.total_review_comment_count();
-        if new_count != original_count {
-            cx.emit(EditorEvent::ReviewCommentsChanged {
-                total_count: new_count,
-            });
+        if !self.stored_review_comments.is_empty() {
             cx.notify();
         }
     }
@@ -2396,6 +2514,8 @@ impl Editor {
     /// Compares two DiffHunkKeys for equality by resolving their anchors.
     fn hunk_keys_match(a: &DiffHunkKey, b: &DiffHunkKey, snapshot: &MultiBufferSnapshot) -> bool {
         a.file_path == b.file_path
+            && a.hunk_start_anchor.is_valid(snapshot)
+            && b.hunk_start_anchor.is_valid(snapshot)
             && a.hunk_start_anchor.to_point(snapshot) == b.hunk_start_anchor.to_point(snapshot)
     }
 
@@ -2444,6 +2564,10 @@ impl Editor {
                         .find(|overlay| {
                             Editor::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot)
                         })
+                        .filter(|overlay| {
+                            overlay.anchor_range.start.is_valid(&snapshot)
+                                && overlay.anchor_range.end.is_valid(&snapshot)
+                        })
                         .map(|o| {
                             let start_point = o.anchor_range.start.to_point(&snapshot);
                             let end_point = o.anchor_range.end.to_point(&snapshot);
@@ -2477,6 +2601,8 @@ impl Editor {
         let comment_count = comments.len();
         let avatar_size = px(20.);
         let action_icon_size = IconSize::XSmall;
+        let editor_handle_for_add = editor_handle.clone();
+        let prompt_editor_for_add = prompt_editor.clone();
 
         v_flex()
             .w_full()
@@ -2557,11 +2683,16 @@ impl Editor {
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
                                     .tooltip(Tooltip::text("Add comment"))
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(
-                                            Box::new(crate::actions::SubmitDiffReviewComment),
-                                            cx,
-                                        );
+                                    .on_click(move |_, window, cx| {
+                                        if let Some(editor) = editor_handle_for_add.upgrade() {
+                                            editor.update(cx, |editor, cx| {
+                                                editor.submit_diff_review_comment_for_prompt(
+                                                    &prompt_editor_for_add,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
                                     }),
                             ),
                     ),
@@ -2796,10 +2927,10 @@ impl Editor {
     }
 }
 
-#[cfg(test)]
 impl Editor {
     /// Returns the line range for the first diff review overlay, if one is active.
     /// Returns (start_row, end_row) as physical line numbers in the underlying file.
+    #[cfg(test)]
     pub(super) fn diff_review_line_range(&self, cx: &App) -> Option<(u32, u32)> {
         let overlay = self.diff_review_overlays.first()?;
         let snapshot = self.buffer.read(cx).snapshot(cx);
@@ -2816,16 +2947,128 @@ impl Editor {
         Some((start_row, end_row))
     }
 
+    /// Returns a non-destructive snapshot of all stored review comments.
+    pub fn review_comment_payloads(&self, cx: &App) -> Vec<ReviewCommentPayload> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        self.stored_review_comments
+            .iter()
+            .flat_map(|(hunk_key, comments)| {
+                let hunk_stale = !hunk_key.hunk_start_anchor.is_valid(&snapshot);
+                let snapshot = snapshot.clone();
+                comments.iter().map(move |comment| ReviewCommentPayload {
+                    id: comment.id,
+                    comment: comment.comment.clone(),
+                    target: ReviewCommentTarget::Hunk {
+                        file_path: hunk_key.file_path.clone(),
+                        hunk_start: hunk_key.hunk_start_anchor,
+                        range: comment.range.clone(),
+                        original_hunk_line: comment.original_hunk_line,
+                        original_range: comment.original_range,
+                        stale: hunk_stale
+                            || !comment.range.start.is_valid(&snapshot)
+                            || !comment.range.end.is_valid(&snapshot),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Returns serializable review records for the agent-review store.
+    ///
+    /// Anchor-backed editor state is deliberately projected into rows and
+    /// content context here. Consumers should persist the returned target data
+    /// and their own durable IDs, not the transient `editor_id` or anchors.
+    pub fn review_comment_records(&self, cx: &App) -> Vec<ReviewCommentRecord> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        self.stored_review_comments
+            .iter()
+            .flat_map(|(hunk_key, comments)| {
+                let snapshot = snapshot.clone();
+                comments.iter().map(move |comment| {
+                    let hunk_stale = !hunk_key.hunk_start_anchor.is_valid(&snapshot);
+                    let resolved_hunk_line = hunk_key
+                        .hunk_start_anchor
+                        .is_valid(&snapshot)
+                        .then(|| hunk_key.hunk_start_anchor.to_point(&snapshot).row);
+                    let resolved_range = comment
+                        .range
+                        .start
+                        .is_valid(&snapshot)
+                        .then(|| comment.range.end.is_valid(&snapshot))
+                        .and_then(|_| {
+                            let start = comment.range.start.to_point(&snapshot);
+                            let end = comment.range.end.to_point(&snapshot);
+                            Some((start.row, end.row))
+                        });
+                    let stale = hunk_stale || resolved_range.is_none();
+                    ReviewCommentRecord {
+                        editor_id: comment.id,
+                        comment: comment.comment.clone(),
+                        target: ReviewCommentTargetData::Hunk {
+                            file_path: hunk_key.file_path.as_unix_str().to_string(),
+                            original_hunk_line: comment.original_hunk_line,
+                            original_range: comment.original_range,
+                            resolved_hunk_line,
+                            resolved_range,
+                            content_context: comment.content_context.clone(),
+                            stale,
+                        },
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Clears pending review comments after a successful handoff.
+    pub fn clear_review_comments(&mut self, cx: &mut Context<Self>) {
+        // Dismiss all overlays when taking comments (e.g., when sending to agent)
+        self.dismiss_all_diff_review_overlays(cx);
+        if self.stored_review_comments.is_empty() {
+            return;
+        }
+        self.stored_review_comments.clear();
+        // Reset the ID counter since all comments have been taken
+        self.next_review_comment_id = 0;
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
+    }
+
+    /// Clears only the comments included in a successfully delivered review.
+    pub fn clear_review_comments_with_ids(
+        &mut self,
+        comment_ids: &HashSet<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if comment_ids.is_empty() {
+            return;
+        }
+
+        let mut removed = false;
+        for (_, comments) in &mut self.stored_review_comments {
+            let previous_len = comments.len();
+            comments.retain(|comment| !comment_ids.contains(&comment.id));
+            removed |= comments.len() != previous_len;
+        }
+        self.stored_review_comments
+            .retain(|(_, comments)| !comments.is_empty());
+
+        if removed {
+            self.dismiss_overlays_without_comments(cx);
+            cx.emit(EditorEvent::ReviewCommentsChanged {
+                total_count: self.total_review_comment_count(),
+            });
+            cx.notify();
+        }
+    }
+
     /// Takes all stored comments from all hunks, clearing the storage.
     /// Returns a Vec of (hunk_key, comments) pairs.
+    #[cfg(test)]
     pub(super) fn take_all_review_comments(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Vec<(DiffHunkKey, Vec<StoredReviewComment>)> {
-        // Dismiss all overlays when taking comments (e.g., when sending to agent)
-        self.dismiss_all_diff_review_overlays(cx);
         let comments = std::mem::take(&mut self.stored_review_comments);
-        // Reset the ID counter since all comments have been taken
         self.next_review_comment_id = 0;
         cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
         cx.notify();
