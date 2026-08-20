@@ -54,7 +54,8 @@ use smol::future::poll_once;
 use std::{
     cell::RefCell,
     env,
-    io::{self, IsTerminal},
+    fs::OpenOptions,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process,
     rc::Rc,
@@ -197,6 +198,21 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 }
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
+fn log_startup_time(label: &str) {
+    if let Some(start) = STARTUP_TIME.get() {
+        let elapsed = start.elapsed();
+        log::info!("STARTUP: {} at {:?}", label, elapsed);
+        // Also write to a file for easier collection
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/zed_startup_times.log")
+        {
+            let _ = writeln!(file, "{}: {:?}", label, elapsed);
+        }
+    }
+}
+
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
 
@@ -296,6 +312,7 @@ fn main() {
     }
 
     zlog::init();
+    log_startup_time("zlog_init");
 
     if stdout_is_a_pty() {
         zlog::init_output_stdout();
@@ -331,6 +348,7 @@ fn main() {
         .thread_name(|ix| format!("RayonWorker{}", ix))
         .build_global()
         .unwrap();
+    log_startup_time("rayon_init");
 
     log::info!(
         "========== starting zed version {}, sha {} ==========",
@@ -341,6 +359,7 @@ fn main() {
             .as_deref()
             .unwrap_or("unknown"),
     );
+    log_startup_time("version_log");
 
     #[cfg(windows)]
     check_for_conpty_dll();
@@ -348,8 +367,10 @@ fn main() {
     let app = build_application()
         .with_assets(Assets)
         .with_restart_arguments(restart_arguments);
+    log_startup_time("app_built");
 
     let app_db = db::AppDatabase::new();
+    log_startup_time("db_created");
     let system_id = app.background_executor().spawn(system_id());
     let installation_id = app
         .background_executor()
@@ -359,6 +380,7 @@ fn main() {
         session_id.clone(),
         KeyValueStore::from_app_db(&app_db),
     ));
+    log_startup_time("sessions_init");
     let background_executor = app.background_executor();
 
     let (open_listener, mut open_rx) = OpenListener::new();
@@ -483,6 +505,7 @@ fn main() {
     });
 
     app.run(move |cx| {
+        log_startup_time("app_run_start");
         cx.set_global(app_db);
         let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
             Ok(trusted_paths) => trusted_paths,
@@ -492,16 +515,20 @@ fn main() {
             }
         };
         trusted_worktrees::init(db_trusted_paths, cx);
+        log_startup_time("trusted_worktrees_init");
         menu::init();
         zed_actions::init();
+        log_startup_time("menu_actions_init");
 
         release_channel::init(app_version, cx);
         gpui_tokio::init(cx);
+        log_startup_time("gpui_tokio_init");
         if let Some(app_commit_sha) = app_commit_sha {
             AppCommitSha::set_global(app_commit_sha, cx);
         }
         settings::init(cx);
         zlog_settings::init(cx);
+        log_startup_time("settings_init");
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
 
@@ -524,10 +551,12 @@ fn main() {
 
         GitHostingProviderRegistry::set_global(git_hosting_provider_registry, cx);
         git_hosting_providers::init(cx);
+        log_startup_time("git_providers_init");
 
         OpenListener::set_global(cx, open_listener.clone());
 
         extension::init(cx);
+        log_startup_time("extension_init");
         let extension_host_proxy = ExtensionHostProxy::global(cx);
 
         let client = Client::production(cx);
@@ -587,17 +616,22 @@ fn main() {
             extension_host_proxy.clone(),
             languages.clone(),
         );
+        log_startup_time("language_extension_init");
 
         Client::set_global(client.clone(), cx);
+        log_startup_time("client_init");
 
         zed::init(cx);
+        log_startup_time("zed_init");
         #[cfg(target_os = "macos")]
         zed::move_to_applications::init(cx);
         project::Project::init(&client, cx);
+        log_startup_time("project_init");
         debugger_ui::init(cx);
         debugger_tools::init(cx);
         client::init(&client, cx);
         feature_flags::FeatureFlagStore::init(cx);
+        log_startup_time("debugger_client_init");
 
         let system_id = cx.foreground_executor().block_on(system_id).ok();
         let installation_id = cx.foreground_executor().block_on(installation_id).ok();
@@ -789,6 +823,7 @@ fn main() {
         inspector_ui::init(app_state.clone(), cx);
         json_schema_store::init(cx);
         miniprofiler_ui::init(*STARTUP_TIME.get().unwrap(), cx);
+        log_startup_time("ui_components_init");
         which_key::init(cx);
         #[cfg(target_os = "windows")]
         etw_tracing::init(cx);
