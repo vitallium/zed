@@ -1030,6 +1030,21 @@ impl SettingsStore {
         self.language_semantic_token_rules.get(language)
     }
 
+    /// Sets language-specific semantic token rules for multiple languages at once.
+    ///
+    /// This is more efficient than calling `set_language_semantic_token_rules` multiple times
+    /// as it only triggers a single settings recomputation.
+    pub fn set_language_semantic_token_rules_batch(
+        &mut self,
+        rules: impl IntoIterator<Item = (SharedString, SemanticTokenRules)>,
+        cx: &mut App,
+    ) {
+        for (language, rule) in rules {
+            self.language_semantic_token_rules.insert(language, rule);
+        }
+        self.recompute_values(None, cx);
+    }
+
     /// Add or remove a set of local settings via a JSON string.
     pub fn set_local_settings(
         &mut self,

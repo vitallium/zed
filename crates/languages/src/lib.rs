@@ -7,6 +7,7 @@ use rust::CargoManifestProvider;
 use settings::{SemanticTokenRules, SettingsStore};
 use smol::stream::StreamExt;
 use std::sync::Arc;
+use std::time::Instant;
 use util::ResultExt;
 
 pub use language::*;
@@ -15,6 +16,19 @@ use crate::{
     json::JsonTaskProvider,
     python::{BasedPyrightLspAdapter, RuffLspAdapter},
 };
+
+fn log_lang_init(label: &str, start: &Instant) {
+    use std::io::Write;
+    let elapsed = start.elapsed();
+    eprintln!("LANG_INIT: {}: {:?}", label, elapsed);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/zed_lang_init_times.log")
+    {
+        let _ = writeln!(file, "{}: {:?}", label, elapsed);
+    }
+}
 
 mod bash;
 mod c;
@@ -56,10 +70,18 @@ pub static LANGUAGE_GIT_COMMIT: std::sync::LazyLock<Arc<Language>> =
     });
 
 pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime, cx: &mut App) {
+    let start = Instant::now();
+    eprintln!("LANG_INIT: start");
+    
     #[cfg(feature = "load-grammars")]
-    languages.register_native_grammars(grammars::native_grammars());
+    {
+        let native_start = Instant::now();
+        languages.register_native_grammars(grammars::native_grammars());
+        log_lang_init("native_grammars_registered", &start);
+    }
 
     let bash_lsp_adapter = Arc::new(bash::BashLspAdapter::new(node.clone()));
+    log_lang_init("bash_adapter_created", &start);
     let c_lsp_adapter = Arc::new(c::CLspAdapter);
     let css_lsp_adapter = Arc::new(css::CssLspAdapter::new(node.clone()));
     let eslint_adapter = Arc::new(eslint::EsLintLspAdapter::new(node.clone(), fs.clone()));
@@ -86,6 +108,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     ));
     let vtsls_adapter = Arc::new(vtsls::VtslsLspAdapter::new(node.clone(), fs.clone()));
     let yaml_lsp_adapter = Arc::new(yaml::YamlLspAdapter::new(node));
+    log_lang_init("all_adapters_created", &start);
 
     let built_in_languages = [
         LanguageInfo {
@@ -221,18 +244,61 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         },
     ];
 
+    log_lang_init("starting_language_registration", &start);
+    
+    // Collect semantic token rules to batch update them at the end
+    // This avoids calling recompute_values multiple times
+    let mut semantic_token_rules_to_set = Vec::new();
+    
     for registration in built_in_languages {
-        register_language(
-            &languages,
-            registration.name,
-            registration.adapters,
-            registration.context,
-            registration.toolchain,
-            registration.manifest_name,
-            registration.semantic_token_rules,
-            cx,
+        let config = load_config(registration.name);
+        let name = registration.name;
+        let context = registration.context.clone();
+        let toolchain = registration.toolchain.clone();
+        let manifest_name = registration.manifest_name.clone();
+        let config_for_closure = config.clone();
+        
+        for adapter in registration.adapters {
+            languages.register_lsp_adapter(config.name.clone(), adapter);
+        }
+        languages.register_language(
+            config.name.clone(),
+            config.grammar.clone(),
+            config.matcher.clone(),
+            config.hidden,
+            manifest_name.clone(),
+            Arc::new(move || {
+                let config = config_for_closure.clone();
+                let context = context.clone();
+                let toolchain = toolchain.clone();
+                let manifest_name = manifest_name.clone();
+                async move {
+                    Ok(LoadedLanguage {
+                        config,
+                        queries: grammars::load_queries(name),
+                        context_provider: context,
+                        toolchain_provider: toolchain,
+                        manifest_name,
+                    })
+                }
+                .boxed()
+            }),
         );
+        
+        // Collect semantic token rules for batch update
+        if let Some(rules) = registration.semantic_token_rules {
+            semantic_token_rules_to_set.push((config.name.0.clone(), rules));
+        }
     }
+    
+    // Batch update all semantic token rules at once
+    if !semantic_token_rules_to_set.is_empty() {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.set_language_semantic_token_rules_batch(semantic_token_rules_to_set, cx);
+        });
+    }
+    
+    log_lang_init("all_languages_registered", &start);
 
     // Register globally available language servers.
     //
@@ -288,13 +354,16 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     for language in tailwind_languages {
         languages.register_lsp_adapter(language.into(), tailwind_adapter.clone());
     }
+    log_lang_init("tailwind_registered", &start);
 
     let eslint_languages = ["TSX", "TypeScript", "JavaScript", "Vue.js", "Svelte"];
     for language in eslint_languages {
         languages.register_lsp_adapter(language.into(), eslint_adapter.clone());
     }
+    log_lang_init("eslint_registered", &start);
 
     let mut subscription = languages.subscribe();
+    log_lang_init("subscription_created", &start);
     let mut prev_language_settings = languages.language_settings();
 
     cx.spawn(async move |cx| {
@@ -326,6 +395,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     for provider in manifest_providers {
         project::ManifestProvidersStore::global(cx).register(provider);
     }
+    log_lang_init("languages_init_complete", &start);
 }
 
 #[derive(Default)]
@@ -336,50 +406,6 @@ struct LanguageInfo {
     toolchain: Option<Arc<dyn ToolchainLister>>,
     manifest_name: Option<ManifestName>,
     semantic_token_rules: Option<SemanticTokenRules>,
-}
-
-fn register_language(
-    languages: &LanguageRegistry,
-    name: &'static str,
-    adapters: Vec<Arc<dyn LspAdapter>>,
-    context: Option<Arc<dyn ContextProvider>>,
-    toolchain: Option<Arc<dyn ToolchainLister>>,
-    manifest_name: Option<ManifestName>,
-    semantic_token_rules: Option<SemanticTokenRules>,
-    cx: &mut App,
-) {
-    let config = load_config(name);
-    if let Some(rules) = &semantic_token_rules {
-        SettingsStore::update_global(cx, |store, cx| {
-            store.set_language_semantic_token_rules(config.name.0.clone(), rules.clone(), cx);
-        });
-    }
-    for adapter in adapters {
-        languages.register_lsp_adapter(config.name.clone(), adapter);
-    }
-    languages.register_language(
-        config.name.clone(),
-        config.grammar.clone(),
-        config.matcher.clone(),
-        config.hidden,
-        manifest_name.clone(),
-        Arc::new(move || {
-            let config = config.clone();
-            let context = context.clone();
-            let toolchain = toolchain.clone();
-            let manifest_name = manifest_name.clone();
-            async move {
-                Ok(LoadedLanguage {
-                    config,
-                    queries: grammars::load_queries(name),
-                    context_provider: context,
-                    toolchain_provider: toolchain,
-                    manifest_name,
-                })
-            }
-            .boxed()
-        }),
-    );
 }
 
 #[cfg(any(test, feature = "test-support"))]
