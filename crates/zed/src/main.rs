@@ -370,7 +370,7 @@ fn main() {
     log_startup_time("app_built");
 
     let app_db = db::AppDatabase::new();
-    log_startup_time("db_created");
+    log_startup_time("db_initialized");  // Note: actual DB connection is lazy, opened on first access
     let system_id = app.background_executor().spawn(system_id());
     let installation_id = app
         .background_executor()

@@ -20,9 +20,10 @@ use sqlez::thread_safe_connection::ThreadSafeConnection;
 use sqlez_macros::sql;
 use std::fs::create_dir_all;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{LazyLock, atomic::Ordering};
+use std::sync::{LazyLock, OnceLock, atomic::Ordering};
 use util::{ResultExt, maybe};
 use zed_env_vars::ZED_STATELESS;
 
@@ -38,7 +39,7 @@ inventory::collect!(DomainMigration);
 
 /// The shared database connection backing all domain-specific DB wrappers.
 /// Set as a GPUI global per-App. Falls back to a shared LazyLock if not set.
-pub struct AppDatabase(pub ThreadSafeConnection);
+pub struct AppDatabase(OnceLock<ThreadSafeConnection>);
 
 impl Global for AppDatabase {}
 
@@ -61,18 +62,33 @@ impl AppDatabase {
     /// Opens the production database and runs all inventory-registered
     /// migrations in dependency order.
     pub fn new() -> Self {
-        let db_dir = database_dir();
-        let connection = gpui::block_on(open_db::<AppMigrator>(db_dir, *RELEASE_CHANNEL));
-        Self(connection)
+        Self(OnceLock::new())
+    }
+
+    /// Returns the per-App connection, initializing it lazily if needed.
+    pub fn get(&self) -> &ThreadSafeConnection {
+        self.0.get_or_init(|| {
+            let start = std::time::Instant::now();
+            let db_dir = database_dir();
+            let connection = gpui::block_on(open_db::<AppMigrator>(db_dir, *RELEASE_CHANNEL));
+            let elapsed = start.elapsed();
+            eprintln!("DB_INIT: database opened and migrations applied: {:?}", elapsed);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/zed_startup_times.log")
+            {
+                let _ = std::writeln!(file, "db_actual_init: {:?}", elapsed);
+            }
+            connection
+        })
     }
 
     /// Creates a new in-memory database with a unique name and runs all
     /// inventory-registered migrations in dependency order.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_new() -> Self {
-        let name = format!("test-db-{}", uuid::Uuid::new_v4());
-        let connection = gpui::block_on(open_test_db::<AppMigrator>(&name));
-        Self(connection)
+        Self(OnceLock::new())
     }
 
     /// Returns the per-App connection if set, otherwise falls back to
@@ -80,14 +96,15 @@ impl AppDatabase {
     pub fn global(cx: &App) -> &ThreadSafeConnection {
         #[allow(unreachable_code)]
         if let Some(db) = cx.try_global::<Self>() {
-            return &db.0;
+            return db.get();
         } else {
             #[cfg(any(feature = "test-support", test))]
-            return &TEST_APP_DATABASE.0;
+            return TEST_APP_DATABASE.get().get();
 
             panic!("database not initialized")
         }
     }
+
 }
 
 fn topological_sort<'a>(registrations: &[&'a DomainMigration]) -> Vec<&'a DomainMigration> {
