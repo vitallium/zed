@@ -54,8 +54,7 @@ use smol::future::poll_once;
 use std::{
     cell::RefCell,
     env,
-    fs::OpenOptions,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     process,
     rc::Rc,
@@ -202,14 +201,6 @@ fn log_startup_time(label: &str) {
     if let Some(start) = STARTUP_TIME.get() {
         let elapsed = start.elapsed();
         log::info!("STARTUP: {} at {:?}", label, elapsed);
-        // Also write to a file for easier collection
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/zed_startup_times.log")
-        {
-            let _ = writeln!(file, "{}: {:?}", label, elapsed);
-        }
     }
 }
 
@@ -370,16 +361,18 @@ fn main() {
     log_startup_time("app_built");
 
     let app_db = db::AppDatabase::new();
-    log_startup_time("db_initialized");  // Note: actual DB connection is lazy, opened on first access
+    log_startup_time("db_initialized"); // Note: actual DB connection is lazy, opened on first access
     let system_id = app.background_executor().spawn(system_id());
-    let installation_id = app
-        .background_executor()
-        .spawn(installation_id(KeyValueStore::from_app_db(&app_db)));
+    let installation_id = app.background_executor().spawn({
+        let app_db = app_db.clone();
+        async move { installation_id(KeyValueStore::from_app_db(&app_db)).await }
+    });
     let session_id = Uuid::new_v4().to_string();
-    let session = app.background_executor().spawn(Session::new(
-        session_id.clone(),
-        KeyValueStore::from_app_db(&app_db),
-    ));
+    let session = app.background_executor().spawn({
+        let app_db = app_db.clone();
+        let session_id = session_id.clone();
+        async move { Session::new(session_id, KeyValueStore::from_app_db(&app_db)).await }
+    });
     log_startup_time("sessions_init");
     let background_executor = app.background_executor();
 

@@ -18,16 +18,8 @@ use crate::{
 };
 
 fn log_lang_init(label: &str, start: &Instant) {
-    use std::io::Write;
     let elapsed = start.elapsed();
-    eprintln!("LANG_INIT: {}: {:?}", label, elapsed);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/zed_lang_init_times.log")
-    {
-        let _ = writeln!(file, "{}: {:?}", label, elapsed);
-    }
+    log::info!("LANG_INIT: {label}: {elapsed:?}");
 }
 
 mod bash;
@@ -72,10 +64,9 @@ pub static LANGUAGE_GIT_COMMIT: std::sync::LazyLock<Arc<Language>> =
 pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime, cx: &mut App) {
     let start = Instant::now();
     eprintln!("LANG_INIT: start");
-    
+
     #[cfg(feature = "load-grammars")]
     {
-        let native_start = Instant::now();
         languages.register_native_grammars(grammars::native_grammars());
         log_lang_init("native_grammars_registered", &start);
     }
@@ -245,11 +236,11 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     ];
 
     log_lang_init("starting_language_registration", &start);
-    
+
     // Collect semantic token rules to batch update them at the end
     // This avoids calling recompute_values multiple times
     let mut semantic_token_rules_to_set = Vec::new();
-    
+
     for registration in built_in_languages {
         let config = load_config(registration.name);
         let name = registration.name;
@@ -257,7 +248,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         let toolchain = registration.toolchain.clone();
         let manifest_name = registration.manifest_name.clone();
         let config_for_closure = config.clone();
-        
+
         for adapter in registration.adapters {
             languages.register_lsp_adapter(config.name.clone(), adapter);
         }
@@ -284,20 +275,20 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
                 .boxed()
             }),
         );
-        
+
         // Collect semantic token rules for batch update
         if let Some(rules) = registration.semantic_token_rules {
             semantic_token_rules_to_set.push((config.name.0.clone(), rules));
         }
     }
-    
+
     // Batch update all semantic token rules at once
     if !semantic_token_rules_to_set.is_empty() {
         SettingsStore::update_global(cx, |store, cx| {
             store.set_language_semantic_token_rules_batch(semantic_token_rules_to_set, cx);
         });
     }
-    
+
     log_lang_init("all_languages_registered", &start);
 
     // Register globally available language servers.

@@ -20,10 +20,9 @@ use sqlez::thread_safe_connection::ThreadSafeConnection;
 use sqlez_macros::sql;
 use std::fs::create_dir_all;
 use std::future::Future;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{LazyLock, OnceLock, atomic::Ordering};
+use std::sync::{Arc, LazyLock, OnceLock, atomic::Ordering};
 use util::{ResultExt, maybe};
 use zed_env_vars::ZED_STATELESS;
 
@@ -39,7 +38,8 @@ inventory::collect!(DomainMigration);
 
 /// The shared database connection backing all domain-specific DB wrappers.
 /// Set as a GPUI global per-App. Falls back to a shared LazyLock if not set.
-pub struct AppDatabase(OnceLock<ThreadSafeConnection>);
+#[derive(Clone)]
+pub struct AppDatabase(Arc<OnceLock<ThreadSafeConnection>>);
 
 impl Global for AppDatabase {}
 
@@ -62,7 +62,7 @@ impl AppDatabase {
     /// Opens the production database and runs all inventory-registered
     /// migrations in dependency order.
     pub fn new() -> Self {
-        Self(OnceLock::new())
+        Self(Arc::new(OnceLock::new()))
     }
 
     /// Returns the per-App connection, initializing it lazily if needed.
@@ -72,14 +72,10 @@ impl AppDatabase {
             let db_dir = database_dir();
             let connection = gpui::block_on(open_db::<AppMigrator>(db_dir, *RELEASE_CHANNEL));
             let elapsed = start.elapsed();
-            eprintln!("DB_INIT: database opened and migrations applied: {:?}", elapsed);
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/zed_startup_times.log")
-            {
-                let _ = std::writeln!(file, "db_actual_init: {:?}", elapsed);
-            }
+            log::info!(
+                "DB_INIT: database opened and migrations applied: {:?}",
+                elapsed
+            );
             connection
         })
     }
@@ -88,7 +84,9 @@ impl AppDatabase {
     /// inventory-registered migrations in dependency order.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_new() -> Self {
-        Self(OnceLock::new())
+        let name = format!("app_database_test_{}", uuid::Uuid::new_v4());
+        let connection = gpui::block_on(open_test_db::<AppMigrator>(&name));
+        Self(Arc::new(OnceLock::from(connection)))
     }
 
     /// Returns the per-App connection if set, otherwise falls back to
@@ -99,12 +97,11 @@ impl AppDatabase {
             return db.get();
         } else {
             #[cfg(any(feature = "test-support", test))]
-            return TEST_APP_DATABASE.get().get();
+            return LazyLock::force(&TEST_APP_DATABASE).get();
 
             panic!("database not initialized")
         }
     }
-
 }
 
 fn topological_sort<'a>(registrations: &[&'a DomainMigration]) -> Vec<&'a DomainMigration> {
@@ -316,7 +313,7 @@ mod tests {
     use sqlez::domain::Domain;
     use sqlez_macros::sql;
 
-    use crate::open_db;
+    use crate::{AppDatabase, open_db};
 
     // Test bad migration panics
     #[gpui::test]
@@ -374,6 +371,29 @@ mod tests {
             good_db.select_row::<usize>("SELECT * FROM test2").unwrap()()
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_app_database_test_new_is_isolated() {
+        let first = AppDatabase::test_new();
+        assert!(
+            first
+                .get()
+                .write(|connection| -> anyhow::Result<()> {
+                    let mut statement = connection.exec("CREATE TABLE test_isolation(value);")?;
+                    statement()
+                })
+                .await
+                .is_ok()
+        );
+
+        let second = AppDatabase::test_new();
+        assert!(
+            second
+                .get()
+                .select_row::<i64>("SELECT * FROM test_isolation")
+                .is_err()
         );
     }
 
