@@ -701,68 +701,77 @@ fn summarize(files: Vec<FileReport>) -> SummaryReport {
     }
 }
 
+fn format_counts(counts: &[(usize, &str)]) -> String {
+    let parts = counts
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        "ok".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 fn print_text_report(summary: &SummaryReport) {
-    for file in &summary.files {
+    let name_width = summary
+        .files
+        .iter()
+        .flat_map(|file| file.themes.iter())
+        .map(|theme| theme.theme_name.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    for (file_index, file) in summary.files.iter().enumerate() {
+        if file_index > 0 {
+            println!();
+        }
         println!("{}", file.path);
+
         for theme in &file.themes {
-            println!("  theme: {}", theme.theme_name);
-            println!(
-                "    missing_non_syntax: {} | unknown_non_syntax: {} | deprecated_non_syntax: {} | syntax_uncovered: {} | syntax_covered_by_ancestor: {} | syntax_exact: {}",
-                theme.missing_non_syntax.len(),
-                theme.unknown_non_syntax.len(),
-                theme.deprecated_non_syntax.len(),
-                theme.syntax_uncovered.len(),
-                theme.syntax_covered_by_ancestor.len(),
-                theme.syntax_exact_count,
-            );
+            let counts = format_counts(&[
+                (theme.syntax_exact_count, "exact"),
+                (theme.syntax_covered_by_ancestor.len(), "inherited"),
+                (theme.missing_non_syntax.len(), "missing"),
+                (theme.unknown_non_syntax.len(), "unknown"),
+                (theme.deprecated_non_syntax.len(), "deprecated"),
+                (theme.syntax_uncovered.len(), "uncovered"),
+            ]);
+            println!("  {:<name_width$}  {counts}", theme.theme_name);
 
-            if !theme.missing_non_syntax.is_empty() {
-                println!("    missing_non_syntax_keys:");
-                for key in &theme.missing_non_syntax {
-                    println!("      - {key}");
-                }
+            for key in &theme.missing_non_syntax {
+                println!("    {:<10}  {key}", "missing");
             }
-
-            if !theme.unknown_non_syntax.is_empty() {
-                println!("    unknown_non_syntax_keys:");
-                for key in &theme.unknown_non_syntax {
-                    println!("      - {key}");
-                }
+            for key in &theme.unknown_non_syntax {
+                println!("    {:<10}  {key}", "unknown");
             }
-
-            if !theme.deprecated_non_syntax.is_empty() {
-                println!("    deprecated_non_syntax_keys:");
-                for key in &theme.deprecated_non_syntax {
-                    println!("      - {key}");
-                }
+            for key in &theme.deprecated_non_syntax {
+                println!("    {:<10}  {key}", "deprecated");
             }
-
-            if !theme.syntax_uncovered.is_empty() {
-                println!("    syntax_uncovered_keys:");
-                for key in &theme.syntax_uncovered {
-                    println!("      - {key}");
-                }
+            for key in &theme.syntax_uncovered {
+                println!("    {:<10}  {key}", "uncovered");
             }
-
-            if !theme.syntax_covered_by_ancestor.is_empty() {
-                println!("    warnings (syntax covered by ancestor):");
-                for coverage in &theme.syntax_covered_by_ancestor {
-                    println!(
-                        "      - {} (covered by {})",
-                        coverage.capture, coverage.covered_by
-                    );
-                }
+            for coverage in &theme.syntax_covered_by_ancestor {
+                println!(
+                    "    {:<10}  {} <- {}",
+                    "inherited", coverage.capture, coverage.covered_by
+                );
             }
         }
     }
 
+    println!();
     println!(
-        "totals: missing_non_syntax={} unknown_non_syntax={} deprecated_non_syntax={} syntax_uncovered={} syntax_covered_by_ancestor={}",
-        summary.total_missing_non_syntax,
-        summary.total_unknown_non_syntax,
-        summary.total_deprecated_non_syntax,
-        summary.total_syntax_uncovered,
-        summary.total_syntax_covered_by_ancestor,
+        "totals: {}",
+        format_counts(&[
+            (summary.total_missing_non_syntax, "missing"),
+            (summary.total_unknown_non_syntax, "unknown"),
+            (summary.total_deprecated_non_syntax, "deprecated"),
+            (summary.total_syntax_uncovered, "uncovered"),
+            (summary.total_syntax_covered_by_ancestor, "inherited"),
+        ])
     );
 }
 
@@ -960,6 +969,15 @@ pub normal: Option<ThemeColor>,";
             total_syntax_uncovered: uncovered,
             total_syntax_covered_by_ancestor: 0,
         }
+    }
+
+    #[test]
+    fn formats_counts_without_zero_categories() {
+        assert_eq!(
+            format_counts(&[(37, "exact"), (5, "inherited"), (0, "missing")]),
+            "37 exact, 5 inherited"
+        );
+        assert_eq!(format_counts(&[(0, "missing"), (0, "unknown")]), "ok");
     }
 
     #[test]
