@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,13 +12,21 @@ use walkdir::WalkDir;
 
 const THEME_CONTENT_PATH: &str = "crates/settings_content/src/theme.rs";
 const SYNTAX_CORE_PATH: &str = "docs/src/extensions/languages.md";
+const BACKGROUND_APPEARANCE_KEY: &str = "background.appearance";
+const BACKGROUND_APPEARANCE_VALUES: [&str; 5] = [
+    "opaque",
+    "transparent",
+    "blurred",
+    "mica_backdrop",
+    "mica_alt_backdrop",
+];
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
     about = "Check Zed theme family files for key coverage",
-    long_about = "Validate Zed theme family files (themes[].style) against available non-syntax and syntax keys.",
+    long_about = "Validate Zed theme family files (themes[].style) against available non-syntax and syntax keys, and check that color values parse.",
     after_help = "Examples:\n  script/check-theme-keys --theme path/to/theme.json\n  script/check-theme-keys --theme-glob \"assets/themes/**/*.json\" --syntax-level both --format json\n  script/check-theme-keys --theme themes/my.json --strict --fail-on unknown,uncovered,deprecated\n\nExit codes:\n  0 = pass\n  1 = policy violation (with --strict)\n  2 = runtime or parse error"
 )]
 struct Args {
@@ -39,6 +47,8 @@ struct Args {
     strict: bool,
 
     /// Comma-separated failure kinds: uncovered,unknown,deprecated.
+    ///
+    /// `deprecated` implies `--deprecated include`.
     #[arg(long, default_value = "unknown,uncovered")]
     fail_on: String,
 
@@ -79,7 +89,7 @@ enum DeprecatedMode {
     Exclude,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum FailKind {
     Uncovered,
     Unknown,
@@ -147,6 +157,14 @@ fn run() -> Result<i32> {
     let key_sets = load_key_sets(&repo_root)?;
     let fail_kinds = parse_fail_kinds(&args.fail_on)?;
 
+    // Deprecated keys are only reported in include mode, so `--fail-on deprecated` would
+    // otherwise never fire.
+    let deprecated_mode = if fail_kinds.contains(&FailKind::Deprecated) {
+        DeprecatedMode::Include
+    } else {
+        args.deprecated
+    };
+
     let syntax_expected = expected_syntax_keys(&key_sets, args.syntax_level);
 
     let mut file_reports = Vec::new();
@@ -156,7 +174,7 @@ fn run() -> Result<i32> {
             &path,
             &key_sets,
             &syntax_expected,
-            args.deprecated,
+            deprecated_mode,
         )?;
         file_reports.push(report);
     }
@@ -247,7 +265,9 @@ fn load_key_sets(repo_root: &Path) -> Result<KeySets> {
     let theme_colors_block = extract_struct_block(&theme_content, "ThemeColorsContent")?;
     let status_colors_block = extract_struct_block(&theme_content, "StatusColorsContent")?;
 
-    let deprecated_non_syntax = extract_deprecated_keys(theme_colors_block)?;
+    let mut deprecated_non_syntax = extract_deprecated_keys(theme_colors_block)?;
+    deprecated_non_syntax.extend(extract_deprecated_keys(status_colors_block)?);
+    deprecated_non_syntax.extend(extract_deprecated_keys(theme_style_block)?);
 
     let mut expected_non_syntax = BTreeSet::new();
     expected_non_syntax.extend(extract_serde_renames(theme_style_block)?);
@@ -257,6 +277,19 @@ fn load_key_sets(repo_root: &Path) -> Result<KeySets> {
 
     let syntax_core = extract_core_syntax_keys(&syntax_core_md)?;
     let syntax_observed = extract_observed_syntax_keys(repo_root)?;
+
+    // An empty set means the source layout changed and the check would silently pass.
+    if expected_non_syntax.is_empty() {
+        bail!(
+            "found no theme style keys in {THEME_CONTENT_PATH}; the schema layout probably changed"
+        );
+    }
+    if syntax_core.is_empty() {
+        bail!("found no syntax captures under '### Syntax highlighting' in {SYNTAX_CORE_PATH}");
+    }
+    if syntax_observed.is_empty() {
+        bail!("found no syntax captures in any highlights.scm under the repo root");
+    }
 
     Ok(KeySets {
         expected_non_syntax,
@@ -312,6 +345,7 @@ fn extract_deprecated_keys(block: &str) -> Result<BTreeSet<String>> {
     let mut pending_rename: Option<String> = None;
     let mut pending_deprecated_attr = false;
     let mut pending_deprecated_doc = false;
+    let mut previous_line_was_doc = false;
     let mut deprecated = BTreeSet::new();
 
     for line in block.lines() {
@@ -319,18 +353,34 @@ fn extract_deprecated_keys(block: &str) -> Result<BTreeSet<String>> {
 
         if let Some(caps) = rename_regex.captures(trimmed) {
             pending_rename = Some(caps[1].to_string());
+            previous_line_was_doc = false;
             continue;
         }
 
         if trimmed == "#[deprecated]" {
             pending_deprecated_attr = true;
+            previous_line_was_doc = false;
             continue;
         }
 
-        if trimmed.starts_with("///") && trimmed.to_ascii_lowercase().contains("deprecated") {
-            pending_deprecated_doc = true;
+        if trimmed.starts_with("///") {
+            // Only a doc block that opens with "Deprecated" marks the field, so prose such as
+            // "replaces the deprecated foo color" on a live field does not.
+            if !previous_line_was_doc {
+                pending_deprecated_doc = false;
+            }
+            previous_line_was_doc = true;
+            if trimmed
+                .trim_start_matches("///")
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("deprecated")
+            {
+                pending_deprecated_doc = true;
+            }
             continue;
         }
+        previous_line_was_doc = false;
 
         if let Some(caps) = field_regex.captures(trimmed) {
             let field_name = caps[1].to_string();
@@ -391,12 +441,45 @@ fn extract_observed_syntax_keys(repo_root: &Path) -> Result<BTreeSet<String>> {
 
         let content = fs::read_to_string(entry.path())
             .with_context(|| format!("failed to read {}", entry.path().display()))?;
-        for captures in regex.captures_iter(&content) {
-            result.insert(captures[1].to_string());
+        for captures in regex.captures_iter(&strip_string_literals(&content)) {
+            let capture = &captures[1];
+            // `_`-prefixed captures are tree-sitter helpers that themes never style.
+            if capture.starts_with('_') {
+                continue;
+            }
+            result.insert(capture.to_string());
         }
     }
 
     Ok(result)
+}
+
+fn strip_string_literals(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for character in content.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if character == '"' {
+            in_string = true;
+            continue;
+        }
+
+        result.push(character);
+    }
+
+    result
 }
 
 fn expected_syntax_keys(key_sets: &KeySets, level: SyntaxLevel) -> BTreeSet<String> {
@@ -458,10 +541,14 @@ fn analyze_theme_file(
             }
             if key == "syntax" {
                 if let Some(map) = val.as_object() {
+                    for (capture, capture_style) in map {
+                        validate_syntax_style(&theme_name, capture, capture_style)?;
+                    }
                     syntax_keys.extend(map.keys().cloned());
                 }
                 continue;
             }
+            validate_non_syntax_value(&theme_name, key, val)?;
             present_non_syntax.insert(key.clone());
         }
 
@@ -526,6 +613,55 @@ fn analyze_theme_file(
     })
 }
 
+fn validate_non_syntax_value(theme_name: &str, key: &str, value: &Value) -> Result<()> {
+    // Every style field is an `Option`, so `null` means "not set".
+    if value.is_null() {
+        return Ok(());
+    }
+
+    if key == BACKGROUND_APPEARANCE_KEY {
+        let appearance = value.as_str().ok_or_else(|| {
+            anyhow!("theme '{theme_name}' key '{key}' must be a string, found {value}")
+        })?;
+        if !BACKGROUND_APPEARANCE_VALUES.contains(&appearance) {
+            bail!(
+                "theme '{theme_name}' key '{key}' has unsupported value '{appearance}'; expected one of {}",
+                BACKGROUND_APPEARANCE_VALUES.join(", ")
+            );
+        }
+        return Ok(());
+    }
+
+    let color = value.as_str().ok_or_else(|| {
+        anyhow!("theme '{theme_name}' key '{key}' must be a color string, found {value}")
+    })?;
+    theme::try_parse_color(color)
+        .with_context(|| format!("theme '{theme_name}' key '{key}' has invalid color '{color}'"))?;
+    Ok(())
+}
+
+fn validate_syntax_style(theme_name: &str, capture: &str, value: &Value) -> Result<()> {
+    let Some(style) = value.as_object() else {
+        return Ok(());
+    };
+    let Some(color) = style.get("color") else {
+        return Ok(());
+    };
+    if color.is_null() {
+        return Ok(());
+    }
+
+    let color = color.as_str().ok_or_else(|| {
+        anyhow!(
+            "theme '{theme_name}' syntax capture '{capture}' color must be a string, found {color}"
+        )
+    })?;
+    theme::try_parse_color(color).with_context(|| {
+        format!("theme '{theme_name}' syntax capture '{capture}' has invalid color '{color}'")
+    })?;
+    Ok(())
+}
+
 fn find_covering_ancestor(capture: &str, syntax_keys: &BTreeSet<String>) -> Option<String> {
     let mut parts: Vec<&str> = capture.split('.').collect();
     while parts.len() > 1 {
@@ -571,12 +707,13 @@ fn print_text_report(summary: &SummaryReport) {
         for theme in &file.themes {
             println!("  theme: {}", theme.theme_name);
             println!(
-                "    missing_non_syntax: {} | unknown_non_syntax: {} | deprecated_non_syntax: {} | syntax_uncovered: {} | syntax_covered_by_ancestor: {}",
+                "    missing_non_syntax: {} | unknown_non_syntax: {} | deprecated_non_syntax: {} | syntax_uncovered: {} | syntax_covered_by_ancestor: {} | syntax_exact: {}",
                 theme.missing_non_syntax.len(),
                 theme.unknown_non_syntax.len(),
                 theme.deprecated_non_syntax.len(),
                 theme.syntax_uncovered.len(),
                 theme.syntax_covered_by_ancestor.len(),
+                theme.syntax_exact_count,
             );
 
             if !theme.missing_non_syntax.is_empty() {
@@ -629,35 +766,36 @@ fn print_text_report(summary: &SummaryReport) {
     );
 }
 
+// Annotations go to stderr so `--format json` stays parseable on stdout.
 fn print_github_annotations(summary: &SummaryReport) {
     for file in &summary.files {
         for theme in &file.themes {
             for key in &theme.missing_non_syntax {
-                println!(
+                eprintln!(
                     "::error file={}::theme '{}' missing non-syntax key '{}'",
                     file.path, theme.theme_name, key
                 );
             }
             for key in &theme.unknown_non_syntax {
-                println!(
+                eprintln!(
                     "::error file={}::theme '{}' unknown non-syntax key '{}'",
                     file.path, theme.theme_name, key
                 );
             }
             for key in &theme.deprecated_non_syntax {
-                println!(
+                eprintln!(
                     "::warning file={}::theme '{}' deprecated non-syntax key '{}'",
                     file.path, theme.theme_name, key
                 );
             }
             for key in &theme.syntax_uncovered {
-                println!(
+                eprintln!(
                     "::error file={}::theme '{}' uncovered syntax capture '{}'",
                     file.path, theme.theme_name, key
                 );
             }
             for coverage in &theme.syntax_covered_by_ancestor {
-                println!(
+                eprintln!(
                     "::warning file={}::theme '{}' syntax capture '{}' covered by ancestor '{}'",
                     file.path, theme.theme_name, coverage.capture, coverage.covered_by
                 );
@@ -686,29 +824,13 @@ fn parse_fail_kinds(value: &str) -> Result<BTreeSet<FailKind>> {
 }
 
 fn has_policy_violations(summary: &SummaryReport, fail_kinds: &BTreeSet<FailKind>) -> bool {
-    let mut counts = BTreeMap::new();
-    counts.insert(
-        FailKind::Uncovered,
-        summary.total_missing_non_syntax + summary.total_syntax_uncovered,
-    );
-    counts.insert(FailKind::Unknown, summary.total_unknown_non_syntax);
-    counts.insert(FailKind::Deprecated, summary.total_deprecated_non_syntax);
-
-    fail_kinds
-        .iter()
-        .any(|kind| counts.get(kind).copied().unwrap_or(0) > 0)
-}
-
-impl Ord for FailKind {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (*self as u8).cmp(&(*other as u8))
-    }
-}
-
-impl PartialOrd for FailKind {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+    fail_kinds.iter().any(|kind| match kind {
+        FailKind::Uncovered => {
+            summary.total_missing_non_syntax + summary.total_syntax_uncovered > 0
+        }
+        FailKind::Unknown => summary.total_unknown_non_syntax > 0,
+        FailKind::Deprecated => summary.total_deprecated_non_syntax > 0,
+    })
 }
 
 #[cfg(test)]
@@ -749,5 +871,155 @@ mod tests {
         assert!(result.contains("comment"));
         assert!(result.contains("function.method"));
         assert!(!result.contains("open"));
+    }
+
+    #[test]
+    fn extracts_serde_renames_from_struct_block() {
+        let input = "pub struct Demo {\n    #[serde(rename = \"border.variant\")]\n    pub border_variant: Option<ThemeColor>,\n    #[serde(rename = \"scrollbar_thumb.background\", skip_serializing)]\n    pub scrollbar_thumb: Option<ThemeColor>,\n    #[serde(default)]\n    pub plain: Option<ThemeColor>,\n}";
+        let renames = extract_serde_renames(input).unwrap();
+
+        assert_eq!(
+            renames,
+            BTreeSet::from([
+                "border.variant".to_string(),
+                "scrollbar_thumb.background".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn marks_only_fields_that_are_deprecated() {
+        let input = "\
+/// Deprecated in favor of `new_name`.\n\
+#[deprecated]\n\
+pub old_name: Option<ThemeColor>,\n\
+\n\
+/// Replaces the deprecated foo color.\n\
+#[serde(rename = \"live.key\")]\n\
+pub live: Option<ThemeColor>,\n\
+\n\
+/// The deprecated version of `scrollbar.thumb.background`.\n\
+#[serde(rename = \"scrollbar_thumb.background\")]\n\
+pub deprecated_scrollbar_thumb_background: Option<ThemeColor>,\n\
+\n\
+/// A normal field.\n\
+#[serde(rename = \"normal.key\")]\n\
+pub normal: Option<ThemeColor>,";
+
+        let deprecated = extract_deprecated_keys(input).unwrap();
+
+        assert_eq!(
+            deprecated,
+            BTreeSet::from([
+                "old_name".to_string(),
+                "scrollbar_thumb.background".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn ignores_string_literals_and_internal_captures() {
+        let input = "(identifier) @function\n(#any-of? @function \"@media\" \"@charset\")\n(identifier) @_parent";
+        let regex = Regex::new(r"@([A-Za-z0-9_.]+)").unwrap();
+        let captures = regex
+            .captures_iter(&strip_string_literals(input))
+            .map(|caps| caps[1].to_string())
+            .filter(|capture| !capture.starts_with('_'))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(captures, BTreeSet::from(["function".to_string()]));
+    }
+
+    #[test]
+    fn rejects_invalid_non_syntax_values() {
+        assert!(validate_non_syntax_value("t", "background", &Value::from("#ffffff")).is_ok());
+        assert!(validate_non_syntax_value("t", "background", &Value::from("not-a-color")).is_err());
+        assert!(validate_non_syntax_value("t", "text", &Value::from(123)).is_err());
+        assert!(validate_non_syntax_value("t", "text", &Value::Null).is_ok());
+        assert!(
+            validate_non_syntax_value("t", BACKGROUND_APPEARANCE_KEY, &Value::from("transparent"))
+                .is_ok()
+        );
+        assert!(
+            validate_non_syntax_value("t", BACKGROUND_APPEARANCE_KEY, &Value::from("glowing"))
+                .is_err()
+        );
+    }
+
+    fn summary_with_totals(
+        missing: usize,
+        unknown: usize,
+        deprecated: usize,
+        uncovered: usize,
+    ) -> SummaryReport {
+        SummaryReport {
+            files: Vec::new(),
+            total_missing_non_syntax: missing,
+            total_unknown_non_syntax: unknown,
+            total_deprecated_non_syntax: deprecated,
+            total_syntax_uncovered: uncovered,
+            total_syntax_covered_by_ancestor: 0,
+        }
+    }
+
+    #[test]
+    fn fails_policy_only_for_configured_kinds() {
+        let deprecated_only = BTreeSet::from([FailKind::Deprecated]);
+        let unknown_only = BTreeSet::from([FailKind::Unknown]);
+
+        assert!(has_policy_violations(
+            &summary_with_totals(0, 0, 2, 0),
+            &deprecated_only
+        ));
+        assert!(!has_policy_violations(
+            &summary_with_totals(0, 0, 2, 0),
+            &unknown_only
+        ));
+        assert!(!has_policy_violations(
+            &summary_with_totals(0, 0, 0, 0),
+            &deprecated_only
+        ));
+    }
+
+    #[test]
+    fn reports_missing_unknown_and_deprecated_keys() {
+        let path = std::env::temp_dir().join(format!(
+            "theme_checker_test_{}_{}.json",
+            std::process::id(),
+            line!()
+        ));
+        fs::write(
+            &path,
+            r##"{"themes":[{"name":"Demo","style":{"background":"#000000","bogus.key":"#ffffff","scrollbar_thumb.background":"#111111","syntax":{"function":"#ffffff"}}}]}"##,
+        )
+        .unwrap();
+
+        let key_sets = KeySets {
+            expected_non_syntax: BTreeSet::from(["background".to_string(), "text".to_string()]),
+            deprecated_non_syntax: BTreeSet::from(["scrollbar_thumb.background".to_string()]),
+            syntax_core: BTreeSet::from(["function".to_string(), "keyword".to_string()]),
+            syntax_observed: BTreeSet::new(),
+        };
+        let expected_syntax = BTreeSet::from(["function".to_string(), "keyword".to_string()]);
+
+        let report = analyze_theme_file(
+            Path::new("/"),
+            &path,
+            &key_sets,
+            &expected_syntax,
+            DeprecatedMode::Include,
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let theme = &report.themes[0];
+        assert_eq!(theme.missing_non_syntax, vec!["text".to_string()]);
+        assert_eq!(theme.unknown_non_syntax, vec!["bogus.key".to_string()]);
+        assert_eq!(
+            theme.deprecated_non_syntax,
+            vec!["scrollbar_thumb.background".to_string()]
+        );
+        assert_eq!(theme.syntax_uncovered, vec!["keyword".to_string()]);
+        assert_eq!(theme.syntax_exact_count, 1);
     }
 }
