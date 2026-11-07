@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
@@ -20,6 +21,24 @@ const BACKGROUND_APPEARANCE_VALUES: [&str; 5] = [
     "mica_backdrop",
     "mica_alt_backdrop",
 ];
+
+const NON_COLOR_STYLE_KEYS: [&str; 2] = ["accents", "players"];
+
+const SKIPPED_DIRECTORIES: [&str; 3] = [".git", "target", "node_modules"];
+
+static SERDE_RENAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"#\[serde\(rename = "([^"]+)"(?:, [^\)]*)?\)\]"#)
+        .expect("valid serde rename regex")
+});
+
+static STRUCT_FIELD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^pub\s+([a-zA-Z0-9_]+)\s*:").expect("valid struct field regex"));
+
+static CORE_SYNTAX_ROW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\|\s*@([a-z0-9_.]+)\s*\|").expect("valid syntax row regex"));
+
+static CAPTURE_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@([A-Za-z0-9_.]+)").expect("valid capture name regex"));
 
 #[derive(Parser, Debug)]
 #[command(
@@ -83,7 +102,7 @@ enum OutputFormat {
     Json,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum DeprecatedMode {
     Include,
     Exclude,
@@ -156,14 +175,7 @@ fn run() -> Result<i32> {
     let theme_files = resolve_theme_files(&repo_root, &args.themes, &args.theme_globs)?;
     let key_sets = load_key_sets(&repo_root)?;
     let fail_kinds = parse_fail_kinds(&args.fail_on)?;
-
-    // Deprecated keys are only reported in include mode, so `--fail-on deprecated` would
-    // otherwise never fire.
-    let deprecated_mode = if fail_kinds.contains(&FailKind::Deprecated) {
-        DeprecatedMode::Include
-    } else {
-        args.deprecated
-    };
+    let deprecated_mode = effective_deprecated_mode(&fail_kinds, args.deprecated);
 
     let syntax_expected = expected_syntax_keys(&key_sets, args.syntax_level);
 
@@ -234,7 +246,7 @@ fn resolve_theme_files(
         }
         let set = builder.build()?;
 
-        for entry in WalkDir::new(repo_root).into_iter().filter_map(Result::ok) {
+        for entry in walk_sources(repo_root) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -265,20 +277,19 @@ fn load_key_sets(repo_root: &Path) -> Result<KeySets> {
     let theme_colors_block = extract_struct_block(&theme_content, "ThemeColorsContent")?;
     let status_colors_block = extract_struct_block(&theme_content, "StatusColorsContent")?;
 
-    let mut deprecated_non_syntax = extract_deprecated_keys(theme_colors_block)?;
-    deprecated_non_syntax.extend(extract_deprecated_keys(status_colors_block)?);
-    deprecated_non_syntax.extend(extract_deprecated_keys(theme_style_block)?);
+    let mut deprecated_non_syntax = extract_deprecated_keys(theme_colors_block);
+    deprecated_non_syntax.extend(extract_deprecated_keys(status_colors_block));
+    deprecated_non_syntax.extend(extract_deprecated_keys(theme_style_block));
 
     let mut expected_non_syntax = BTreeSet::new();
-    expected_non_syntax.extend(extract_serde_renames(theme_style_block)?);
-    expected_non_syntax.extend(extract_serde_renames(theme_colors_block)?);
-    expected_non_syntax.extend(extract_serde_renames(status_colors_block)?);
+    expected_non_syntax.extend(extract_serde_renames(theme_style_block));
+    expected_non_syntax.extend(extract_serde_renames(theme_colors_block));
+    expected_non_syntax.extend(extract_serde_renames(status_colors_block));
     expected_non_syntax.retain(|key| !deprecated_non_syntax.contains(key));
 
-    let syntax_core = extract_core_syntax_keys(&syntax_core_md)?;
+    let syntax_core = extract_core_syntax_keys(&syntax_core_md);
     let syntax_observed = extract_observed_syntax_keys(repo_root)?;
 
-    // An empty set means the source layout changed and the check would silently pass.
     if expected_non_syntax.is_empty() {
         bail!(
             "found no theme style keys in {THEME_CONTENT_PATH}; the schema layout probably changed"
@@ -330,18 +341,14 @@ fn extract_struct_block<'a>(content: &'a str, struct_name: &str) -> Result<&'a s
     Ok(&content[start..end])
 }
 
-fn extract_serde_renames(block: &str) -> Result<BTreeSet<String>> {
-    let regex = Regex::new(r#"#\[serde\(rename = "([^"]+)"(?:, [^\)]*)?\)\]"#)?;
-    Ok(regex
+fn extract_serde_renames(block: &str) -> BTreeSet<String> {
+    SERDE_RENAME
         .captures_iter(block)
-        .map(|caps| caps[1].to_string())
-        .collect())
+        .map(|captures| captures[1].to_string())
+        .collect()
 }
 
-fn extract_deprecated_keys(block: &str) -> Result<BTreeSet<String>> {
-    let rename_regex = Regex::new(r#"#\[serde\(rename = "([^"]+)"(?:, [^\)]*)?\)\]"#)?;
-    let field_regex = Regex::new(r"^pub\s+([a-zA-Z0-9_]+)\s*:")?;
-
+fn extract_deprecated_keys(block: &str) -> BTreeSet<String> {
     let mut pending_rename: Option<String> = None;
     let mut pending_deprecated_attr = false;
     let mut pending_deprecated_doc = false;
@@ -351,8 +358,8 @@ fn extract_deprecated_keys(block: &str) -> Result<BTreeSet<String>> {
     for line in block.lines() {
         let trimmed = line.trim();
 
-        if let Some(caps) = rename_regex.captures(trimmed) {
-            pending_rename = Some(caps[1].to_string());
+        if let Some(captures) = SERDE_RENAME.captures(trimmed) {
+            pending_rename = Some(captures[1].to_string());
             previous_line_was_doc = false;
             continue;
         }
@@ -364,8 +371,6 @@ fn extract_deprecated_keys(block: &str) -> Result<BTreeSet<String>> {
         }
 
         if trimmed.starts_with("///") {
-            // Only a doc block that opens with "Deprecated" marks the field, so prose such as
-            // "replaces the deprecated foo color" on a live field does not.
             if !previous_line_was_doc {
                 pending_deprecated_doc = false;
             }
@@ -382,8 +387,8 @@ fn extract_deprecated_keys(block: &str) -> Result<BTreeSet<String>> {
         }
         previous_line_was_doc = false;
 
-        if let Some(caps) = field_regex.captures(trimmed) {
-            let field_name = caps[1].to_string();
+        if let Some(captures) = STRUCT_FIELD.captures(trimmed) {
+            let field_name = captures[1].to_string();
             let key = pending_rename.clone().unwrap_or_else(|| field_name.clone());
 
             if pending_deprecated_attr
@@ -399,11 +404,10 @@ fn extract_deprecated_keys(block: &str) -> Result<BTreeSet<String>> {
         }
     }
 
-    Ok(deprecated)
+    deprecated
 }
 
-fn extract_core_syntax_keys(content: &str) -> Result<BTreeSet<String>> {
-    let regex = Regex::new(r"^\|\s*@([a-z0-9_.]+)\s*\|")?;
+fn extract_core_syntax_keys(content: &str) -> BTreeSet<String> {
     let mut in_section = false;
     let mut result = BTreeSet::new();
 
@@ -419,19 +423,31 @@ fn extract_core_syntax_keys(content: &str) -> Result<BTreeSet<String>> {
             continue;
         }
 
-        if let Some(caps) = regex.captures(line) {
-            result.insert(caps[1].to_string());
+        if let Some(captures) = CORE_SYNTAX_ROW.captures(line) {
+            result.insert(captures[1].to_string());
         }
     }
 
-    Ok(result)
+    result
+}
+
+fn walk_sources(repo_root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    WalkDir::new(repo_root)
+        .into_iter()
+        .filter_entry(|entry| !entry.file_type().is_dir() || !is_skipped_directory(entry.path()))
+        .filter_map(Result::ok)
+}
+
+fn is_skipped_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| SKIPPED_DIRECTORIES.contains(&name))
 }
 
 fn extract_observed_syntax_keys(repo_root: &Path) -> Result<BTreeSet<String>> {
-    let regex = Regex::new(r"@([A-Za-z0-9_.]+)")?;
     let mut result = BTreeSet::new();
 
-    for entry in WalkDir::new(repo_root).into_iter().filter_map(Result::ok) {
+    for entry in walk_sources(repo_root) {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -441,17 +457,18 @@ fn extract_observed_syntax_keys(repo_root: &Path) -> Result<BTreeSet<String>> {
 
         let content = fs::read_to_string(entry.path())
             .with_context(|| format!("failed to read {}", entry.path().display()))?;
-        for captures in regex.captures_iter(&strip_string_literals(&content)) {
-            let capture = &captures[1];
-            // `_`-prefixed captures are tree-sitter helpers that themes never style.
-            if capture.starts_with('_') {
-                continue;
-            }
-            result.insert(capture.to_string());
-        }
+        result.extend(observed_captures(&content));
     }
 
     Ok(result)
+}
+
+fn observed_captures(content: &str) -> BTreeSet<String> {
+    CAPTURE_NAME
+        .captures_iter(&strip_string_literals(content))
+        .map(|captures| captures[1].to_string())
+        .filter(|capture| !capture.starts_with('_'))
+        .collect()
 }
 
 fn strip_string_literals(content: &str) -> String {
@@ -536,7 +553,7 @@ fn analyze_theme_file(
         let mut syntax_keys = BTreeSet::new();
 
         for (key, val) in style {
-            if key == "accents" || key == "players" {
+            if NON_COLOR_STYLE_KEYS.contains(&key.as_str()) {
                 continue;
             }
             if key == "syntax" {
@@ -613,8 +630,16 @@ fn analyze_theme_file(
     })
 }
 
+fn validate_color(theme_name: &str, subject: &str, value: &Value) -> Result<()> {
+    let color = value.as_str().ok_or_else(|| {
+        anyhow!("theme '{theme_name}' {subject} must be a color string, found {value}")
+    })?;
+    theme::try_parse_color(color)
+        .with_context(|| format!("theme '{theme_name}' {subject} has invalid color '{color}'"))?;
+    Ok(())
+}
+
 fn validate_non_syntax_value(theme_name: &str, key: &str, value: &Value) -> Result<()> {
-    // Every style field is an `Option`, so `null` means "not set".
     if value.is_null() {
         return Ok(());
     }
@@ -632,12 +657,7 @@ fn validate_non_syntax_value(theme_name: &str, key: &str, value: &Value) -> Resu
         return Ok(());
     }
 
-    let color = value.as_str().ok_or_else(|| {
-        anyhow!("theme '{theme_name}' key '{key}' must be a color string, found {value}")
-    })?;
-    theme::try_parse_color(color)
-        .with_context(|| format!("theme '{theme_name}' key '{key}' has invalid color '{color}'"))?;
-    Ok(())
+    validate_color(theme_name, &format!("key '{key}'"), value)
 }
 
 fn validate_syntax_style(theme_name: &str, capture: &str, value: &Value) -> Result<()> {
@@ -651,15 +671,7 @@ fn validate_syntax_style(theme_name: &str, capture: &str, value: &Value) -> Resu
         return Ok(());
     }
 
-    let color = color.as_str().ok_or_else(|| {
-        anyhow!(
-            "theme '{theme_name}' syntax capture '{capture}' color must be a string, found {color}"
-        )
-    })?;
-    theme::try_parse_color(color).with_context(|| {
-        format!("theme '{theme_name}' syntax capture '{capture}' has invalid color '{color}'")
-    })?;
-    Ok(())
+    validate_color(theme_name, &format!("syntax capture '{capture}'"), color)
 }
 
 fn find_covering_ancestor(capture: &str, syntax_keys: &BTreeSet<String>) -> Option<String> {
@@ -832,6 +844,17 @@ fn parse_fail_kinds(value: &str) -> Result<BTreeSet<FailKind>> {
     Ok(kinds)
 }
 
+fn effective_deprecated_mode(
+    fail_kinds: &BTreeSet<FailKind>,
+    requested: DeprecatedMode,
+) -> DeprecatedMode {
+    if fail_kinds.contains(&FailKind::Deprecated) {
+        DeprecatedMode::Include
+    } else {
+        requested
+    }
+}
+
 fn has_policy_violations(summary: &SummaryReport, fail_kinds: &BTreeSet<FailKind>) -> bool {
     fail_kinds.iter().any(|kind| match kind {
         FailKind::Uncovered => {
@@ -876,7 +899,7 @@ mod tests {
     #[test]
     fn extracts_core_syntax_keys_from_docs_table() {
         let input = "### Syntax highlighting\n| @comment | Captures comments |\n| @function.method | x |\n### Bracket matching\n| @open | x |";
-        let result = extract_core_syntax_keys(input).unwrap();
+        let result = extract_core_syntax_keys(input);
         assert!(result.contains("comment"));
         assert!(result.contains("function.method"));
         assert!(!result.contains("open"));
@@ -885,7 +908,7 @@ mod tests {
     #[test]
     fn extracts_serde_renames_from_struct_block() {
         let input = "pub struct Demo {\n    #[serde(rename = \"border.variant\")]\n    pub border_variant: Option<ThemeColor>,\n    #[serde(rename = \"scrollbar_thumb.background\", skip_serializing)]\n    pub scrollbar_thumb: Option<ThemeColor>,\n    #[serde(default)]\n    pub plain: Option<ThemeColor>,\n}";
-        let renames = extract_serde_renames(input).unwrap();
+        let renames = extract_serde_renames(input);
 
         assert_eq!(
             renames,
@@ -915,7 +938,7 @@ pub deprecated_scrollbar_thumb_background: Option<ThemeColor>,\n\
 #[serde(rename = \"normal.key\")]\n\
 pub normal: Option<ThemeColor>,";
 
-        let deprecated = extract_deprecated_keys(input).unwrap();
+        let deprecated = extract_deprecated_keys(input);
 
         assert_eq!(
             deprecated,
@@ -927,16 +950,13 @@ pub normal: Option<ThemeColor>,";
     }
 
     #[test]
-    fn ignores_string_literals_and_internal_captures() {
+    fn observed_captures_skips_string_literals_and_internal_names() {
         let input = "(identifier) @function\n(#any-of? @function \"@media\" \"@charset\")\n(identifier) @_parent";
-        let regex = Regex::new(r"@([A-Za-z0-9_.]+)").unwrap();
-        let captures = regex
-            .captures_iter(&strip_string_literals(input))
-            .map(|caps| caps[1].to_string())
-            .filter(|capture| !capture.starts_with('_'))
-            .collect::<BTreeSet<_>>();
 
-        assert_eq!(captures, BTreeSet::from(["function".to_string()]));
+        assert_eq!(
+            observed_captures(input),
+            BTreeSet::from(["function".to_string()])
+        );
     }
 
     #[test]
@@ -978,6 +998,20 @@ pub normal: Option<ThemeColor>,";
             "37 exact, 5 inherited"
         );
         assert_eq!(format_counts(&[(0, "missing"), (0, "unknown")]), "ok");
+    }
+
+    #[test]
+    fn fail_on_deprecated_forces_include_mode() {
+        let requested = DeprecatedMode::Exclude;
+
+        assert_eq!(
+            effective_deprecated_mode(&BTreeSet::from([FailKind::Deprecated]), requested),
+            DeprecatedMode::Include
+        );
+        assert_eq!(
+            effective_deprecated_mode(&BTreeSet::from([FailKind::Unknown]), requested),
+            DeprecatedMode::Exclude
+        );
     }
 
     #[test]
